@@ -1,0 +1,34 @@
+{
+  "name": "rtp-dl",
+  "version": "1.0.1",
+  "description": "Downloads media from RTP servers",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "echo \\\"Error: no test specified\\\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vankxr/rtp-dl.git"
+  },
+  "author": "João Silva <jgc3silva@gmail.com>",
+  "license": "GPL-3.0-or-later",
+  "bin": {
+    "rtp-dl": "./src/index.js"
+  },
+  "pkg": {
+    "scripts": "src/**/*.js",
+    "targets": [
+      "node14-linux-x64",
+      "node14-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+  "bugs": {
+    "url": "https://github.com/vankxr/rtp-dl/issues"
+  },
+  "homepage": "https://github.com/vankxr/rtp-dl#readme",
+  "dependencies": {
+    "commander": "^8.3.0",
+    "node-html-parser": "^5.1.0"
+  }
+}
