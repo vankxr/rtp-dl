@@ -281,19 +281,21 @@ async function rtp_get_program_stream(url)
         if(script.text.indexOf("RTPPlayer") == -1)
             continue;
 
-        let f_match = [...script.text.matchAll(/hls\s?:\s(atob\(\s)?decodeURIComponent\(\[(\"([^\"]+)\"(\,)?)+\].join\(\"\"\)\)/g)];
+        // For audio only programs
+        let f_match = script.text.match(/var\sf\s=\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\;/);
+
+        if(f_match)
+            return f_match[1];
+
+        // Now handle video programs
+        f_match = [...script.text.matchAll(/hls\s?:\s(atob\(\s)?decodeURIComponent\(\[(\"([^\"]+)\"(\,)?)+\].join\(\"\"\)\)/g)];
 
         if(!f_match)
             throw new Error("No stream found");
 
         f_match = f_match.map(m => m[0]);
 
-        let f_str;
-
-        if(on_demand)
-            f_str = f_match[f_match.length - 1];
-        else if(live)
-            f_str = f_match[0];
+        let f_str = f_match[f_match.length - 1];
 
         let c_match = [...f_str.matchAll(/\"([^\"]+)\"(\,)?/g)];
 
@@ -384,3 +386,4 @@ main();
 // Commands for testing
 // node src/index.js -u https://www.rtp.pt/play/direto/rtp1
 // node src/index.js -u https://www.rtp.pt/play/p9317/e571868/doce
+// node src/index.js -p 1085
