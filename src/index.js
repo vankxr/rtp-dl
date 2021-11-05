@@ -4,6 +4,7 @@ const ChildProcess = require("child_process");
 const HTTPS = require("https");
 const { Command } = require("commander");
 const HTML = require("node-html-parser");
+const Colors = require("colors");
 
 const program = new Command();
 const package = JSON.parse(FileSystem.readFileSync(Path.join(__dirname, "../package.json")));
@@ -12,20 +13,35 @@ program.version(package.version, "-v, --version", "Print the current version");
 program.helpOption('-h, --help', 'Display this help information');
 program.showHelpAfterError();
 program.showSuggestionAfterError();
+program.configureOutput(
+    {
+        writeOut: (str) => process.stderr.write(`${str}`),
+        writeErr: (str) => process.stderr.write(`${str}`)
+    }
+);
 
 function parseRTPUrl(url)
 {
-    let pid_match = url.match(/play\/p?(\d+)/);
+    let pid_match = url.match(/play\/p(\d+)(\/e(\d+))?/);
 
     if(pid_match)
-        return parseInt(pid_match[1]);
+        return {
+            url: url,
+            pid: parseInt(pid_match[1]),
+            eid: parseInt(pid_match[3])
+        };
 
     let live_match = url.match(/direto\/([a-zA-Z0-9]+)/);
 
     if(live_match)
-        return live_match[1];
+        return {
+            url: url,
+            channel: live_match[1]
+        };
 
-    return null;
+    return {
+        url: url
+    };
 }
 function atob(str)
 {
@@ -103,13 +119,8 @@ async function rtp_get_program_name(pid)
         throw new Error("Invalid body");
 
     let root = HTML.parse(res.body.toString("utf-8"));
-    let articles = root.getElementsByTagName("article");
-    let first_article = articles[0];
 
-    if(!first_article)
-        throw new Error("Program not found");
-
-    let as = first_article.getElementsByTagName("a");
+    let as = root.getElementsByTagName("a");
     let first_a = as[0];
 
     if(!first_a)
@@ -121,6 +132,81 @@ async function rtp_get_program_name(pid)
         throw new Error("Program not found");
 
     return program_name.split(" - ")[0];
+}
+async function rtp_get_program_seasons(pid)
+{
+    let eps = await rtp_get_program_episodes(pid);
+
+    if(eps.length < 1)
+        throw new Error("No episodes found");
+
+    let url = eps[0].url;
+
+    if(!url)
+        throw new Error("Invalid episode URL");
+
+    let req_options = {
+        host: "www.rtp.pt",
+        port: 443,
+        path: url,
+        method: "GET",
+        headers: {
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": "rtp_cookie_parental=0; rtp_privacy=666; rtp_cookie_privacy=permit 1,2,3,4; googlepersonalization=1; _recid="
+        }
+    };
+
+    let res = await https_request(req_options);
+
+    if(res.statusCode != 200)
+    {
+        let e = new Error("Request unsuccessfull (" + res.statusCode + ")");
+
+        e.details = res.body;
+
+        throw e;
+    }
+
+    if(!res.body)
+        throw new Error("Invalid body");
+
+    let root = HTML.parse(res.body.toString("utf-8"));
+
+    let season_div = root.getElementsByTagName("div").find(
+        function (div)
+        {
+            if(!div.getAttribute("class"))
+                return false;
+
+            if(div.getAttribute("class").indexOf("seasons-available") == -1)
+                return false;
+
+            return true;
+        }
+    );
+
+    if(!season_div)
+        throw new Error("Season div not found");
+
+    let seasons = season_div.getElementsByTagName("a");
+
+    if(!seasons)
+        throw new Error("No seasons found");
+
+    seasons = seasons.map(
+        function (season)
+        {
+            return {
+                number: parseInt(season.text.trim()),
+                pid: parseRTPUrl(season.getAttribute("href")),
+                url: season.getAttribute("href")
+            };
+        }
+    );
+
+    seasons = seasons.filter(season => (!isNaN(season.number) && season.number > 0));
+
+    return seasons;
 }
 async function rtp_get_program_episodes(pid)
 {
@@ -162,18 +248,17 @@ async function rtp_get_program_episodes(pid)
 
         for(let article of articles)
         {
-            let a = article.getElementsByTagName("a");
-            let first_a = a[0];
-
-            if(!first_a)
-                continue;
-
             let episode = {};
 
-            episode.url = first_a.getAttribute("href");
-            episode.title = first_a.getAttribute("title");
+            let a = article.childNodes[1];
 
-            for(let div of first_a.childNodes)
+            if(!a || a.tagName.toLowerCase() != "a")
+                continue;
+
+            episode.url = a.getAttribute("href");
+            episode.title = a.getAttribute("title");
+
+            for(let div of a.childNodes)
             {
                 if(!div.tagName || div.tagName.toLowerCase() != "div")
                     continue;
@@ -221,6 +306,24 @@ async function rtp_get_program_episodes(pid)
                         }
                     }
                     break;
+                }
+            }
+
+            let i = article.childNodes[3];
+
+            if(i && i.tagName.toLowerCase() == "i")
+            {
+                for(let meta of i.childNodes)
+                {
+                    if(!meta.tagName || meta.tagName.toLowerCase() != "meta")
+                        continue;
+
+                    switch (meta.getAttribute("itemprop"))
+                    {
+                        case "description":
+                            episode.description = meta.getAttribute("content");
+                        break;
+                    }
                 }
             }
 
@@ -282,6 +385,8 @@ async function rtp_get_program_stream(url)
             continue;
 
         // For audio only programs
+        //// URL regex stolen from https://stackoverflow.com/a/3809435 :)
+        //// Editted to include the 'var f = "...";´
         let f_match = script.text.match(/var\sf\s=\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\;/);
 
         if(f_match)
@@ -335,26 +440,39 @@ async function run()
         return process.exit(1);
     }
 
-    if(typeof opts.url == "string")
+    if(opts.url)
     {
-        opts.live = true;
-        opts.channel = opts.url;
-    }
-    else if(typeof opts.url == "number")
-    {
-        opts.live = false;
-        opts.pid = opts.url;
+        if(opts.url.channel)
+        {
+            opts.live = true;
+            opts.channel = opts.url.channel;
+        }
+        else if(opts.url.pid)
+        {
+            opts.live = false;
+            opts.pid = opts.url.pid;
+            opts.eid = opts.url.eid;
+        }
+        else
+        {
+            console.log("Invalid url");
+            console.log("No channel or program ID found in URL");
+
+            return process.exit(1);
+        }
     }
 
-    console.log(opts.url);
+    console.log(opts.url.url);
     console.log(opts.live);
     console.log(opts.pid || opts.channel);
+    console.log(opts.eid || "No episode");
 
     let ep_url;
 
     if(!opts.live)
     {
         console.log(await rtp_get_program_name(program.opts().pid));
+        console.log(await rtp_get_program_seasons(program.opts().pid));
         let eps = await rtp_get_program_episodes(program.opts().pid);
         console.log(eps);
         ep_url = eps[0].url;
@@ -386,4 +504,5 @@ main();
 // Commands for testing
 // node src/index.js -u https://www.rtp.pt/play/direto/rtp1
 // node src/index.js -u https://www.rtp.pt/play/p9317/e571868/doce
+// node src/index.js -u https://www.rtp.pt/play/p6755/auga-seca
 // node src/index.js -p 1085
