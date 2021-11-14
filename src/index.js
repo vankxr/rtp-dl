@@ -2,9 +2,11 @@ const Path = require("path");
 const FileSystem = require("fs");
 const ChildProcess = require("child_process");
 const HTTPS = require("https");
+const URL = require("url");
 const { Command } = require("commander");
 const HTML = require("node-html-parser");
 const Colors = require("colors");
+const M3U8Parser = require("../lib/m3u8parser.js");
 
 const program = new Command();
 const package = JSON.parse(FileSystem.readFileSync(Path.join(__dirname, "../package.json")));
@@ -42,6 +44,14 @@ function parseRTPUrl(url)
     return {
         url: url
     };
+}
+function url_rewrite(url, endpoint)
+{
+    let components = url.split("/");
+
+    components[components.length - 1] = endpoint;
+
+    return components.join("/");
 }
 function atob(str)
 {
@@ -89,6 +99,33 @@ async function https_request(options, body)
             req.end();
         }
     );
+}
+function m3u8_request(url)
+{
+    let url_data = URL.parse(url);
+    let req_options = {
+        host: url_data.host,
+        port: 443,
+        path: url_data.path,
+        method: "GET",
+        headers: {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36",
+            "Cookie": "rtp_cookie_parental=0; rtp_privacy=666; rtp_cookie_privacy=permit 1,2,3,4; googlepersonalization=1; _recid="
+        }
+    };
+
+    const parser = new M3U8Parser();
+    const req = HTTPS.request(
+        req_options,
+        function (res)
+        {
+            res.pipe(parser);
+        }
+    )
+
+    req.end();
+
+    return parser;
 }
 
 async function rtp_get_program_name(pid)
@@ -198,7 +235,7 @@ async function rtp_get_program_seasons(pid)
         {
             return {
                 number: parseInt(season.text.trim()),
-                pid: parseRTPUrl(season.getAttribute("href")),
+                pid: parseRTPUrl(season.getAttribute("href")).pid,
                 url: season.getAttribute("href")
             };
         }
@@ -341,7 +378,7 @@ async function rtp_get_program_episodes(pid)
 
     return episodes;
 }
-async function rtp_get_program_stream(url)
+async function rtp_get_stream_url(url)
 {
     let req_options = {
         host: "www.rtp.pt",
@@ -419,6 +456,152 @@ async function rtp_get_program_stream(url)
         return url;
     }
 }
+async function rtp_get_channel_id(url)
+{
+    let req_options = {
+        host: "www.rtp.pt",
+        port: 443,
+        path: url,
+        method: "GET",
+        headers: {
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": "rtp_cookie_parental=0; rtp_privacy=666; rtp_cookie_privacy=permit 1,2,3,4; googlepersonalization=1; _recid="
+        }
+    };
+
+    let res = await https_request(req_options);
+
+    if(res.statusCode != 200)
+    {
+        let e = new Error("Request unsuccessfull (" + res.statusCode + ")");
+
+        e.details = res.body;
+
+        throw e;
+    }
+
+    if(!res.body)
+        throw new Error("Invalid body");
+
+    let live = res.body.toString("utf-8").indexOf("area=\"em-direto\";") != -1;
+
+    if(!live)
+        throw new Error("Invalid stream type. Channel ID only available for live channels");
+
+    let root = HTML.parse(res.body.toString("utf-8"));
+
+    for(let script of root.getElementsByTagName("script"))
+    {
+        if(script.text.indexOf("liveMetadata") == -1)
+            continue;
+
+        let cid_match = script.text.match(/liveMetadata\(\'([0-9]+)\'/);
+
+        if(!cid_match)
+            throw new Error("No channel ID found");
+
+        return parseInt(cid_match[1]);
+    }
+}
+async function rtp_get_channel_live_metadata(cid, cnt_prev = 0, cnt_next = 1)
+{
+    // NOTE: Currently RTP seems to ignore cnt_prev and cnt_next and only returns the current program and the next one.
+    // Until they fix this, we'll just return the current program and the next one.
+
+    let req_options = {
+        host: "www.rtp.pt",
+        port: 443,
+        path: "/play/livechannelmetadata.php?channel=" + cid + "&howmanynext=" + cnt_next + "&howmanybefore=" + cnt_prev,
+        method: "GET",
+        headers: {
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": "rtp_cookie_parental=0; rtp_privacy=666; rtp_cookie_privacy=permit 1,2,3,4; googlepersonalization=1; _recid="
+        }
+    };
+
+    let res = await https_request(req_options);
+
+    if(res.statusCode != 200)
+    {
+        let e = new Error("Request unsuccessfull (" + res.statusCode + ")");
+
+        e.details = res.body;
+
+        throw e;
+    }
+
+    if(!res.body)
+        throw new Error("Invalid body");
+
+    let res_json = JSON.parse(res.body.toString("utf-8"));
+
+    let ret = {
+        current: {},
+        next: [],
+        prev: []
+    };
+
+    let root = HTML.parse(atob(res_json["LiveContentData"]));
+
+    for(let child of root.childNodes)
+    {
+        if(!child || !child.tagName || child.tagName.toLowerCase() != "div")
+            continue;
+
+        if(child.getAttribute("class").indexOf("live-noar") == -1)
+            continue;
+
+        for(let div of child.childNodes)
+        {
+            if(!div || !div.tagName || div.tagName.toLowerCase() != "div")
+                continue;
+
+            let is_current = false;
+            let program = {
+                name: ""
+            };
+
+            for(let b of div.getElementsByTagName("b"))
+            {
+                if(b.getAttribute("itemprop") != "name")
+                    continue;
+
+                program.name = b.textContent;
+
+                break;
+            }
+
+            for(let span of div.getElementsByTagName("span"))
+            {
+                if(span.getAttribute("class").indexOf("stamp") == -1)
+                    continue;
+
+                is_current = span.textContent === "NO AR";
+
+                break;
+            }
+
+            if(is_current)
+                ret.current.name = program.name;
+            else // TODO: Support prev when RTP supports it
+                ret.next.push(program);
+        }
+
+        break;
+    }
+
+    let current_program_root = HTML.parse(atob(res_json["_EPISODIOS_"]));
+
+    if(current_program_root.childNodes.length != 1)
+        throw new Error("Invalid current program metadata");
+
+    let current_url = current_program_root.childNodes[0].getAttribute("href");
+
+    ret.current.url = current_url,
+    ret.current.pid = parseRTPUrl(current_url).pid
+
+    return ret;
+}
 
 async function run()
 {
@@ -462,7 +645,7 @@ async function run()
         }
     }
 
-    console.log(opts.url.url);
+    console.log(opts.url ? opts.url.url : "No URL");
     console.log(opts.live);
     console.log(opts.pid || opts.channel);
     console.log(opts.eid || "No episode");
@@ -483,7 +666,62 @@ async function run()
     }
 
     console.log(ep_url);
-    console.log(await rtp_get_program_stream(ep_url));
+
+    let stream_url = await rtp_get_stream_url(ep_url);
+
+    console.log(stream_url);
+
+    if(opts.live)
+    {
+        let cid = await rtp_get_channel_id(ep_url);
+        console.log(cid);
+        console.log(await rtp_get_channel_live_metadata(cid));
+    }
+
+    let parser = m3u8_request(stream_url);
+
+    parser.on(
+        "item",
+        function (data)
+        {
+            console.log(data);
+            console.log(url_rewrite(stream_url, data.url));
+        }
+    );
+    parser.once(
+        "stream",
+        function (data)
+        {
+            console.log(data);
+
+            let full_url = url_rewrite(stream_url, data.url);
+
+            console.log(full_url);
+
+            let parser2 = m3u8_request(full_url);
+
+            parser2.on(
+                "item",
+                function (data)
+                {
+                    //console.log(data);
+                    console.log(url_rewrite(stream_url, data.url));
+                }
+            );
+            parser2.on("end",
+                function ()
+                {
+                    console.log("End item playlist");
+                }
+            );
+        }
+    );
+    parser.on("end",
+        function ()
+        {
+            console.log("End stream playlist");
+        }
+    );
 }
 
 async function main()
