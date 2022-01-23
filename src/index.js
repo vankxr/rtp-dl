@@ -1,9 +1,10 @@
 const Path = require("path");
 const FileSystem = require("fs");
+const ZLib = require("zlib");
 const ChildProcess = require("child_process");
 const HTTPS = require("https");
 const URL = require("url");
-const { Command } = require("commander");
+const { Command, Option } = require("commander");
 const HTML = require("node-html-parser");
 const Colors = require("colors");
 const M3U8Parser = require("../lib/m3u8parser.js");
@@ -23,6 +24,10 @@ program.configureOutput(
     }
 );
 
+function date_str(date)
+{
+    return date.getDate() + "-" + (date.getMonth() + 1) + "-" + date.getFullYear();
+}
 function parseRTPUrl(url)
 {
     let pid_match = url.match(/play\/p(\d+)(\/e(\d+))?/);
@@ -98,6 +103,9 @@ async function https_request(options, body)
                         {
                             res.body = Buffer.concat(res.body);
 
+                            if(res.headers["content-encoding"] === "gzip")
+                                res.body = ZLib.gunzipSync(res.body);
+
                             return resolve(res);
                         }
                     );
@@ -144,6 +152,9 @@ function ts_request(frag_url, cb)
                 {
                     res.body = Buffer.concat(res.body);
 
+                    if(res.headers["content-encoding"] === "gzip")
+                        res.body = ZLib.gunzipSync(res.body);
+
                     cb(null, res.body);
                 }
             );
@@ -171,7 +182,20 @@ function m3u8_request(url)
         req_options,
         function (res)
         {
-            res.pipe(parser);
+            if(res.headers["content-encoding"] === "gzip")
+            {
+                // Took me a sec to figure out that RTP sometimes responds with gzipped payload
+                // Even though the request does not claim to accept gzip
+                // This seems to happen at random times, and is most frequent for secondary channels (i.e. not RTP1)
+                let gunzip = ZLib.createGunzip();
+
+                res.pipe(gunzip);
+                gunzip.pipe(parser);
+            }
+            else
+            {
+                res.pipe(parser);
+            }
         }
     )
 
@@ -356,11 +380,6 @@ async function download_live(stream_url, file_name)
     return new Promise(
         async function (resolve, reject)
         {
-            let frags = await get_ts_fragments(stream_url);
-
-            if(frags.length === 0)
-                return reject(new Error("No fragments found"));
-
             let update = true;
 
             let ffmpeg_bin_name = "ffmpeg-" + process.platform + (process.platform === "win32" ? ".exe" : "");
@@ -385,6 +404,10 @@ async function download_live(stream_url, file_name)
                 "close",
                 function (code)
                 {
+                    update = false;
+
+                    console.log("Transmuxing/transcoding process finished (" + code + ")");
+
                     return resolve();
                 }
             );
@@ -397,6 +420,14 @@ async function download_live(stream_url, file_name)
                     update = false;
 
                     return reject(e);
+                }
+            );
+
+            ffmpeg.stderr.on(
+                "data",
+                function (data)
+                {
+                    //console.log("ffmpeg stderr: " + data.toString());
                 }
             );
 
@@ -418,7 +449,7 @@ async function download_live(stream_url, file_name)
             let q = new Queue(ts_request);
             let last_frag_seq = 0;
 
-            process.on(
+            process.once(
                 "SIGINT",
                 function ()
                 {
@@ -433,12 +464,16 @@ async function download_live(stream_url, file_name)
                             "end",
                             function ()
                             {
+                                console.log("Fragment queue drained, stopping transcode/transmux");
+
                                 ffmpeg.stdin.end();
                             }
                         );
                     }
                     else
                     {
+                        console.log("Fragment queue drained, stopping transcode/transmux");
+
                         ffmpeg.stdin.end();
                     }
                 }
@@ -446,8 +481,18 @@ async function download_live(stream_url, file_name)
 
             while(update)
             {
+                let frags = [];
                 let frag_cnt = 0;
                 let frag_duration = 0;
+
+                try
+                {
+                    frags = await get_ts_fragments(stream_url);
+                }
+                catch(e)
+                {
+                    frags = [];
+                }
 
                 if(frags.length > 0)
                 {
@@ -474,15 +519,6 @@ async function download_live(stream_url, file_name)
                 }
 
                 await sleep(frag_cnt > 0 ? Math.max(5000, Math.round(frag_duration / frag_cnt * 5)) : 2000); // Set timer for approx. 5 fragments
-
-                try
-                {
-                    frags = await get_ts_fragments(stream_url);
-                }
-                catch(e)
-                {
-                    frags = [];
-                }
             }
         }
     );
@@ -788,7 +824,15 @@ async function rtp_get_stream_url(url)
         if(f_match)
             return f_match[1];
 
-        // Now handle video programs
+        // Handle plain URL video programs
+        //// URL regex stolen from https://stackoverflow.com/a/3809435 :)
+        //// Editted to include the 'hls: "...",´
+        f_match = script.text.match(/hls:\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\,/);
+
+        if(f_match)
+            return f_match[1];
+
+        // Now handle encoded video programs
         f_match = [...script.text.matchAll(/hls\s?:\s(atob\(\s)?decodeURIComponent\(\[(\"([^\"]+)\"(\,)?)+\].join\(\"\"\)\)/g)];
 
         if(!f_match)
@@ -967,6 +1011,99 @@ async function rtp_get_channel_program_metadata(cid, cnt_prev = 0, cnt_next = 1)
 
     return ret;
 }
+async function rtp_get_channel_epg(channel, date)
+{
+    let req_options = {
+        host: "www.rtp.pt",
+        port: 443,
+        path: "/EPG/json/rtp-home-page-tv-radio/list-all-grids/tv/" + (date ? date_str(date) : ""),
+        method: "GET",
+        headers: {
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": "rtp_cookie_parental=0; rtp_privacy=666; rtp_cookie_privacy=permit 1,2,3,4; googlepersonalization=1; _recid="
+        }
+    };
+
+    let res = await https_request(req_options);
+
+    if(res.statusCode != 200)
+    {
+        let e = new Error("Request unsuccessfull (" + res.statusCode + ")");
+
+        e.details = res.body;
+
+        throw e;
+    }
+
+    if(!res.body)
+        throw new Error("Invalid body");
+
+    let res_json = JSON.parse(res.body.toString("utf-8"));
+
+    if(!res_json.result)
+        throw new Error("Invalid result");
+
+    let chan_epg = null;
+
+    for(const chan of Object.keys(res_json.result))
+    {
+        let chan2 = chan.toLowerCase().replace("-", "");
+
+        if(chan2.indexOf(channel.toLowerCase()) == -1)
+            continue;
+
+        chan_epg = res_json.result[chan];
+
+        break;
+    }
+
+    if(!chan_epg)
+        throw new Error("EPG not available for this channel");
+
+    let epg = [];
+
+    if(chan_epg.morning)
+        epg.push(...chan_epg.morning);
+
+    if(chan_epg.afternoon)
+        epg.push(...chan_epg.afternoon);
+
+    if(chan_epg.evening)
+        epg.push(...chan_epg.evening);
+
+    for(let i = 0; i < epg.length; i++)
+    {
+        let epg_item = epg[i];
+
+        if(epg_item.date)
+            epg[i].date = new Date(epg_item.date);
+
+        if(typeof epg_item.name == "string")
+            epg[i].name = epg_item.name.trim();
+
+        if(typeof epg_item.description == "string")
+            epg[i].description = epg_item.description.trim();
+
+        if(epg_item.url)
+        {
+            epg[i].epg_url = epg_item.url;
+
+            delete epg[i].url;
+        }
+
+        if(epg_item.review)
+        {
+            epg[i].url = parseRTPUrl(epg_item.review);
+
+            delete epg[i].review;
+        }
+
+        delete epg[i].image;
+        delete epg[i].liveUrl;
+    }
+
+    return epg;
+}
 
 async function run()
 {
@@ -1018,6 +1155,7 @@ async function run()
     //console.log(opts.pid || opts.channel);
     //console.log(opts.eid || "No episode");
 
+    let file_path = "";
     let file_prefix = "";
     let eps;
 
@@ -1030,8 +1168,8 @@ async function run()
         console.log("Program ID: " + opts.pid);
         console.log("Program name: " + program_name);
 
-        file_prefix += opts.pid;
-        file_prefix += " - " + program_name.replace(".", "").replace("/", "").replace("\\", "");
+        file_path = "p" + opts.pid;
+        file_prefix += program_name.replace(".", "").replace("/", "").replace("\\", "");
 
         let program_seasons = await rtp_get_program_seasons(opts.pid);
 
@@ -1078,8 +1216,27 @@ async function run()
         console.log("Channel ID: " + chan_info.cid);
         console.log("Channel Name: " + chan_info.name);
 
-        file_prefix += chan_info.cid;
-        file_prefix += " - " + chan_info.name.replace(".", "").replace("/", "").replace("\\", "");
+        file_path = "c" + chan_info.cid;
+        file_prefix += chan_info.name.replace(".", "").replace("/", "").replace("\\", "");
+
+        if(opts.listEpg)
+        {
+            let epg = await rtp_get_channel_epg(opts.channel, new Date());
+
+            for(let i = 0; i < epg.length; i++)
+            {
+                delete epg[i].description;
+
+                if(typeof epg[i].url == "object")
+                    epg[i].url = epg[i].url.url;
+
+                epg[i].date = epg[i].date.toLocaleString("pt-PT", { timeZone: "Europe/Lisbon" });
+            }
+
+            console.table(epg);
+
+            return process.exit(0);
+        }
 
         let chan_metadata = await rtp_get_channel_program_metadata(chan_info.cid);
 
@@ -1134,18 +1291,12 @@ async function run()
             if(opts.listStreams)
                 return process.exit(0);
 
-            if(opts.stream !== undefined && opts.stream >= 1 && opts.stream <= streams.length)
-            {
-                console.log("Using Stream " + opts.stream);
+            if(opts.stream < 1 || opts.stream > streams.length)
+                opts.stream = 1;
 
-                stream = streams[opts.stream - 1];
-            }
-            else
-            {
-                console.log("Defaulting to first stream");
+            console.log("Using Stream " + opts.stream);
 
-                stream = streams[0];
-            }
+            stream = streams[opts.stream - 1];
         }
         else
         {
@@ -1163,10 +1314,20 @@ async function run()
             if(ep.title)
                 file_name += " - " + ep.title.replace(".", "").replace("/", "").replace("\\", "");
         }
+        else if(opts.live)
+        {
+            file_name += " - " + Math.round(new Date().getTime() / 1000);
+        }
 
-        file_name += ".mp4";
+        if(!opts.outputDir)
+            opts.outputDir = ".";
+
+        file_name += "." + opts.outputFormat;
+        file_name = Path.join(process.cwd(), opts.outputDir, file_path, file_name);
 
         console.log("Downloading to '" + file_name + "'...");
+
+        FileSystem.mkdirSync(Path.join(process.cwd(), opts.outputDir, file_path), { recursive: true });
 
         if(!opts.live)
         {
@@ -1176,7 +1337,8 @@ async function run()
                     {
                         console.log("Successfully downloaded '" + file_name + "'");
                     }
-                ).catch(
+                )
+                .catch(
                     function (e)
                     {
                         console.log("Error downloading '" + file_name + "'");
@@ -1196,12 +1358,15 @@ async function run()
 async function main()
 {
     program
-        .option("-p, --pid <program-id>", "Program ID from RTP", parseInt)
-        .option("-c, --channel <channel-name>", "Specify RTP channel name when using live mode")
-        .option("-u, --url <rtp-url>", "Specify an RTP URL, automatically detects live channel name and/or program ID", parseRTPUrl)
-        .option("-s, --stream <stream>", "Use this stream if multiple streams exist", parseInt)
-        .option("-S, --list-streams", "List available streams")
-        .option("-d, --debug", "Print debugging information")
+        .addOption(new Option("-p, --pid <program-id>", "Program ID from RTP").argParser(parseInt))
+        .addOption(new Option("-c, --channel <channel-name>", "Specify RTP channel name when using live mode"))
+        .addOption(new Option("-u, --url <rtp-url>", "Specify an RTP URL, automatically detects live channel name and/or program ID").argParser(parseRTPUrl))
+        .addOption(new Option("-s, --stream <stream>", "Use this stream if multiple streams exist").argParser(parseInt).default(1))
+        .addOption(new Option("-o, --output-dir <path>", "Set the output directory for media files").default(".", "Current working directory"))
+        .addOption(new Option("-f, --output-format <format>", "Set the output file format").choices(["ts", "mp4", "mkv"]).default("ts", "ts (MPEG2 Transport Stream)"))
+        .addOption(new Option("-S, --list-streams", "List available streams and exit"))
+        .addOption(new Option("-E, --list-epg", "Print program guide and exit"))
+        .addOption(new Option("-d, --debug", "Print debugging information"))
         .action(run);
 
     await program.parseAsync();

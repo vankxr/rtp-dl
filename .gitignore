@@ -1,3 +1,9 @@
+# Test media files
+*.mp4
+*.mkv
+*.ts
+*.mp3
+
 # Logs
 logs
 *.log
