@@ -17,6 +17,7 @@
   },
   "pkg": {
     "scripts": "src/**/*.js",
+    "assets": "assets/**/*",
     "targets": [
       "node14-linux-x64",
       "node14-win-x64"

@@ -7,6 +7,7 @@ const { Command } = require("commander");
 const HTML = require("node-html-parser");
 const Colors = require("colors");
 const M3U8Parser = require("../lib/m3u8parser.js");
+const Queue = require("../lib/queue.js");
 
 const program = new Command();
 const package = JSON.parse(FileSystem.readFileSync(Path.join(__dirname, "../package.json")));
@@ -53,6 +54,18 @@ function url_rewrite(url, endpoint)
 
     return components.join("/");
 }
+function humanize(value, units = ["B", "KiB", "MiB", "GiB", "TiB"], mul_size = 1024, decimals = 2)
+{
+    let i = 0;
+
+    while(value >= mul_size)
+    {
+        value /= mul_size;
+        i++;
+    }
+
+    return value.toFixed(decimals) + " " + units[i];
+}
 function atob(str)
 {
     return Buffer.from(str, "base64").toString("utf-8");
@@ -89,7 +102,7 @@ async function https_request(options, body)
                         }
                     );
                 }
-            )
+            );
 
             req.on("error", reject);
 
@@ -100,6 +113,46 @@ async function https_request(options, body)
         }
     );
 }
+function ts_request(frag_url, cb)
+{
+    let url_data = URL.parse(frag_url);
+    let req_options = {
+        host: url_data.host,
+        port: 443,
+        path: url_data.path,
+        method: "GET",
+        headers: {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36"
+        }
+    };
+
+    const req = HTTPS.request(
+        req_options,
+        function (res)
+        {
+            res.body = [];
+
+            res.on('data',
+                function (chunk)
+                {
+                    res.body.push(chunk);
+                }
+            );
+
+            res.on('end',
+                function()
+                {
+                    res.body = Buffer.concat(res.body);
+
+                    cb(null, res.body);
+                }
+            );
+        }
+    );
+
+    req.on("error", cb);
+    req.end();
+}
 function m3u8_request(url)
 {
     let url_data = URL.parse(url);
@@ -109,8 +162,7 @@ function m3u8_request(url)
         path: url_data.path,
         method: "GET",
         headers: {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36",
-            "Cookie": "rtp_cookie_parental=0; rtp_privacy=666; rtp_cookie_privacy=permit 1,2,3,4; googlepersonalization=1; _recid="
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36"
         }
     };
 
@@ -126,6 +178,314 @@ function m3u8_request(url)
     req.end();
 
     return parser;
+}
+async function get_streams(master_url)
+{
+    return new Promise(
+        function (resolve, reject)
+        {
+            let streams = [];
+            let parser = m3u8_request(master_url);
+
+            parser.on(
+                "stream",
+                function (data)
+                {
+                    // Bypasses autist "protection" by RTP
+                    data.url = url_rewrite(master_url, data.url);
+
+                    streams.push(data);
+                }
+            );
+
+            parser.once(
+                "end",
+                function ()
+                {
+                    parser.removeAllListeners("stream");
+                    parser.removeAllListeners("error");
+
+                    return resolve(streams);
+                }
+            );
+
+            parser.once(
+                "error",
+                function (e)
+                {
+                    parser.removeAllListeners("stream");
+                    parser.removeAllListeners("end");
+
+                    return reject(e);
+                }
+            );
+        }
+    );
+}
+async function get_ts_fragments(stream_url)
+{
+    return new Promise(
+        function (resolve, reject)
+        {
+            let frags = [];
+            let parser = m3u8_request(stream_url);
+
+            parser.on(
+                "item",
+                function (data)
+                {
+                    // Bypasses autist "protection" by RTP
+                    data.url = url_rewrite(stream_url, data.url);
+
+                    frags.push(data);
+                }
+            );
+
+            parser.once(
+                "end",
+                function ()
+                {
+                    parser.removeAllListeners("item");
+                    parser.removeAllListeners("error");
+
+                    return resolve(frags);
+                }
+            );
+
+            parser.once(
+                "error",
+                function (e)
+                {
+                    parser.removeAllListeners("stream");
+                    parser.removeAllListeners("end");
+
+                    return reject(e);
+                }
+            );
+        }
+    );
+}
+async function download_vod(stream_url, file_name)
+{
+    return new Promise(
+        async function (resolve, reject)
+        {
+            let frags = await get_ts_fragments(stream_url);
+
+            if(frags.length === 0)
+                return reject(new Error("No fragments found"));
+
+            let ffmpeg_bin_name = "ffmpeg-" + process.platform + (process.platform === "win32" ? ".exe" : "");
+            let ffmpeg_bin_path = Path.join(__dirname, "..", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
+            let ffmpeg = ChildProcess.spawn(
+                ffmpeg_bin_path,
+                [
+                    "-y",
+                    "-f",
+                    "mpegts",
+                    "-i",
+                    "pipe:0",
+                    "-c:v",
+                    "copy", // TODO: Add transcoding support
+                    "-c:a",
+                    "copy", // TODO: Add transcoding support
+                    file_name
+                ]
+            );
+
+            ffmpeg.once(
+                "close",
+                function (code)
+                {
+                    if(code !== 0)
+                    {
+                        q.kill();
+
+                        return reject(new Error("Transmuxing/transcoding failed"));
+                    }
+
+                    return resolve();
+                }
+            );
+
+            ffmpeg.on(
+                "error",
+                function (e)
+                {
+                    q.kill();
+
+                    return reject(e);
+                }
+            );
+
+            function ts_req_cb(e, data)
+            {
+                if(e)
+                {
+                    q.kill();
+                    ffmpeg.stdin.end();
+
+                    return reject(e);
+                }
+
+                if(ffmpeg.stdin.writable)
+                    ffmpeg.stdin.write(data);
+            }
+
+            let q = new Queue(ts_request);
+
+            q.once(
+                "end",
+                function ()
+                {
+                    ffmpeg.stdin.end();
+                }
+            );
+
+            frags.forEach(
+                function (frag)
+                {
+                    q.push(frag.url, ts_req_cb);
+                }
+            );
+        }
+    );
+}
+async function download_live(stream_url, file_name)
+{
+    return new Promise(
+        async function (resolve, reject)
+        {
+            let frags = await get_ts_fragments(stream_url);
+
+            if(frags.length === 0)
+                return reject(new Error("No fragments found"));
+
+            let update = true;
+
+            let ffmpeg_bin_name = "ffmpeg-" + process.platform + (process.platform === "win32" ? ".exe" : "");
+            let ffmpeg_bin_path = Path.join(__dirname, "..", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
+            let ffmpeg = ChildProcess.spawn(
+                ffmpeg_bin_path,
+                [
+                    "-y",
+                    "-f",
+                    "mpegts",
+                    "-i",
+                    "pipe:0",
+                    "-c:v",
+                    "copy", // TODO: Add transcoding support
+                    "-c:a",
+                    "copy", // TODO: Add transcoding support
+                    file_name
+                ]
+            );
+
+            ffmpeg.once(
+                "close",
+                function (code)
+                {
+                    return resolve();
+                }
+            );
+
+            ffmpeg.on(
+                "error",
+                function (e)
+                {
+                    q.kill();
+                    update = false;
+
+                    return reject(e);
+                }
+            );
+
+            function ts_req_cb(e, data)
+            {
+                if(e)
+                {
+                    q.kill();
+                    ffmpeg.stdin.end();
+                    update = false;
+
+                    return reject(e);
+                }
+
+                if(ffmpeg.stdin.writable)
+                    ffmpeg.stdin.write(data);
+            }
+
+            let q = new Queue(ts_request);
+            let last_frag_seq = 0;
+
+            process.on(
+                "SIGINT",
+                function ()
+                {
+                    console.log("Got SIGINT, stopping fragment updates");
+                    console.log("Please wait for the list of fragments to drain");
+
+                    update = false;
+
+                    if(q.tasks.length + q.active > 0)
+                    {
+                        q.once(
+                            "end",
+                            function ()
+                            {
+                                ffmpeg.stdin.end();
+                            }
+                        );
+                    }
+                    else
+                    {
+                        ffmpeg.stdin.end();
+                    }
+                }
+            );
+
+            while(update)
+            {
+                let frag_cnt = 0;
+                let frag_duration = 0;
+
+                if(frags.length > 0)
+                {
+                    frags.forEach(
+                        function (frag)
+                        {
+                            if(frag.seq > last_frag_seq || (last_frag_seq > 60000 && frag.seq < 1000))
+                            {
+                                let frags_lost = frag.seq - last_frag_seq - 1;
+
+                                if(last_frag_seq > 0 && frags_lost > 0)
+                                    console.log("Lost " + frags_lost + " fragments");
+
+                                q.push(frag.url, ts_req_cb);
+
+                                frag_cnt++;
+                                frag_duration += frag.duration;
+                                last_frag_seq = frag.seq;
+                            }
+                        }
+                    );
+
+                    console.log("Added " + frag_cnt + " fragments, " + frag_duration + " ms duration, new max " + last_frag_seq);
+                }
+
+                await sleep(frag_cnt > 0 ? Math.max(5000, Math.round(frag_duration / frag_cnt * 5)) : 2000); // Set timer for approx. 5 fragments
+
+                try
+                {
+                    frags = await get_ts_fragments(stream_url);
+                }
+                catch(e)
+                {
+                    frags = [];
+                }
+            }
+        }
+    );
 }
 
 async function rtp_get_program_name(pid)
@@ -177,7 +537,7 @@ async function rtp_get_program_seasons(pid)
     if(eps.length < 1)
         throw new Error("No episodes found");
 
-    let url = eps[0].url;
+    let url = eps[0].url.url;
 
     if(!url)
         throw new Error("Invalid episode URL");
@@ -235,8 +595,7 @@ async function rtp_get_program_seasons(pid)
         {
             return {
                 number: parseInt(season.text.trim()),
-                pid: parseRTPUrl(season.getAttribute("href")).pid,
-                url: season.getAttribute("href")
+                url: parseRTPUrl(season.getAttribute("href"))
             };
         }
     );
@@ -292,7 +651,7 @@ async function rtp_get_program_episodes(pid)
             if(!a || a.tagName.toLowerCase() != "a")
                 continue;
 
-            episode.url = a.getAttribute("href");
+            episode.url = parseRTPUrl(a.getAttribute("href"));
             episode.title = a.getAttribute("title");
 
             for(let div of a.childNodes)
@@ -456,7 +815,7 @@ async function rtp_get_stream_url(url)
         return url;
     }
 }
-async function rtp_get_channel_id(url)
+async function rtp_get_channel_info(url)
 {
     let req_options = {
         host: "www.rtp.pt",
@@ -486,24 +845,31 @@ async function rtp_get_channel_id(url)
     let live = res.body.toString("utf-8").indexOf("area=\"em-direto\";") != -1;
 
     if(!live)
-        throw new Error("Invalid stream type. Channel ID only available for live channels");
+        throw new Error("Invalid stream type. Channel info only available for live channels");
 
     let root = HTML.parse(res.body.toString("utf-8"));
 
     for(let script of root.getElementsByTagName("script"))
     {
-        if(script.text.indexOf("liveMetadata") == -1)
+        if(script.text.indexOf("liveMetadata") == -1 || script.text.indexOf("artist:") == -1)
             continue;
 
         let cid_match = script.text.match(/liveMetadata\(\'([0-9]+)\'/);
+        let cname_match = script.text.match(/artist: \"([^"]+)\",/);
 
         if(!cid_match)
             throw new Error("No channel ID found");
 
-        return parseInt(cid_match[1]);
+        if(!cname_match)
+            throw new Error("No channel name found");
+
+        return {
+            cid: parseInt(cid_match[1]),
+            name: cname_match[1]
+        };
     }
 }
-async function rtp_get_channel_live_metadata(cid, cnt_prev = 0, cnt_next = 1)
+async function rtp_get_channel_program_metadata(cid, cnt_prev = 0, cnt_next = 1)
 {
     // NOTE: Currently RTP seems to ignore cnt_prev and cnt_next and only returns the current program and the next one.
     // Until they fix this, we'll just return the current program and the next one.
@@ -593,12 +959,11 @@ async function rtp_get_channel_live_metadata(cid, cnt_prev = 0, cnt_next = 1)
     let current_program_root = HTML.parse(atob(res_json["_EPISODIOS_"]));
 
     if(current_program_root.childNodes.length != 1)
-        throw new Error("Invalid current program metadata");
+        return ret;
 
     let current_url = current_program_root.childNodes[0].getAttribute("href");
 
-    ret.current.url = current_url,
-    ret.current.pid = parseRTPUrl(current_url).pid
+    ret.current.url = parseRTPUrl(current_url);
 
     return ret;
 }
@@ -610,18 +975,21 @@ async function run()
     if(!opts.url && !opts.channel && !opts.pid)
     {
         console.log("Missing options");
-        console.log("No 'url' or 'pid'/'channel'/'live' combination set");
+        console.log("No 'url' or 'pid'/'channel' combination set");
 
         return process.exit(1);
     }
 
-    if(opts.url && (opts.channel || opts.pid || opts.live))
+    if(opts.url && (opts.channel || opts.pid))
     {
         console.log("Invalid options provided");
-        console.log("Choose either 'url' or 'pid'/'channel'/'live'");
+        console.log("Choose either 'url' or 'pid'/'channel'");
 
         return process.exit(1);
     }
+
+    if(opts.channel)
+        opts.live = true;
 
     if(opts.url)
     {
@@ -645,92 +1013,194 @@ async function run()
         }
     }
 
-    console.log(opts.url ? opts.url.url : "No URL");
-    console.log(opts.live);
-    console.log(opts.pid || opts.channel);
-    console.log(opts.eid || "No episode");
+    //console.log(opts.url ? opts.url.url : "No URL");
+    //console.log(opts.live);
+    //console.log(opts.pid || opts.channel);
+    //console.log(opts.eid || "No episode");
 
-    let ep_url;
+    let file_prefix = "";
+    let eps;
 
     if(!opts.live)
     {
-        console.log(await rtp_get_program_name(program.opts().pid));
-        console.log(await rtp_get_program_seasons(program.opts().pid));
-        let eps = await rtp_get_program_episodes(program.opts().pid);
-        console.log(eps);
-        ep_url = eps[0].url;
+        console.log("Fething data for program ID " + opts.pid + "...");
+
+        let program_name = await rtp_get_program_name(opts.pid);
+
+        console.log("Program ID: " + opts.pid);
+        console.log("Program name: " + program_name);
+
+        file_prefix += opts.pid;
+        file_prefix += " - " + program_name.replace(".", "").replace("/", "").replace("\\", "");
+
+        let program_seasons = await rtp_get_program_seasons(opts.pid);
+
+        console.log("Program seasons: " + (program_seasons.length > 0 ? program_seasons.length : 1));
+
+        if(program_seasons.length > 0)
+            console.log("Selected season: " + program_seasons.find(s => s.url.pid == opts.pid).number);
+
+        let program_eps = await rtp_get_program_episodes(opts.pid);
+
+        //console.log(program_eps);
+
+        console.log("Program episodes: " + program_eps.length);
+
+        if(opts.eid)
+        {
+            let selected_ep = program_eps.find(e => e.url.eid == opts.eid);
+
+            if(!selected_ep)
+            {
+                console.log("Episode not found in program");
+
+                return process.exit(1);
+            }
+
+            console.log("Selected episode: " + selected_ep.id);
+
+            eps = [selected_ep];
+        }
+        else
+        {
+            console.log("All episodes selected");
+
+            eps = program_eps;
+        }
     }
     else
     {
-        ep_url = "/play/direto/" + opts.channel;
+        console.log("Fething data for live channel " + opts.channel + "...");
+
+        let chan_url = "/play/direto/" + opts.channel;
+        let chan_info = await rtp_get_channel_info(chan_url);
+
+        console.log("Channel ID: " + chan_info.cid);
+        console.log("Channel Name: " + chan_info.name);
+
+        file_prefix += chan_info.cid;
+        file_prefix += " - " + chan_info.name.replace(".", "").replace("/", "").replace("\\", "");
+
+        let chan_metadata = await rtp_get_channel_program_metadata(chan_info.cid);
+
+        console.log("Currently playing: " + chan_metadata.current.name);
+        console.log("Next playing: " + chan_metadata.next[0].name);
+
+        eps = [chan_url];
     }
 
-    console.log(ep_url);
-
-    let stream_url = await rtp_get_stream_url(ep_url);
-
-    console.log(stream_url);
-
-    if(opts.live)
+    for(let i = 0; i < eps.length; i++)
     {
-        let cid = await rtp_get_channel_id(ep_url);
-        console.log(cid);
-        console.log(await rtp_get_channel_live_metadata(cid));
+        let ep = eps[i];
+
+        if(eps.length > 1)
+            console.log("Fething data for episode " + (i + 1) + " of " + eps.length + "...");
+
+        //console.log(ep.url.url);
+
+        let master_url = await rtp_get_stream_url(typeof(ep) == "string" ? ep : ep.url.url);
+
+        //console.log(master_url);
+
+        let streams = await get_streams(master_url);
+        let stream;
+
+        if(streams.length > 0)
+        {
+            console.log("Found " + streams.length + " streams");
+
+            for(let i = 0; i < streams.length; i++)
+            {
+                console.log("  Stream " + (i + 1) + ":");
+
+                const stream = streams[i];
+
+                if(stream.bandwidth)
+                    console.log("    Bandwidth: " + humanize(parseInt(stream.bandwidth), ["bps", "kbps", "Mbps"]));
+
+                if(stream.resolution)
+                    console.log("    Resolution: " + stream.resolution);
+
+                if(stream["frame-rate"])
+                    console.log("    Frame rate: " + stream["frame-rate"]);
+
+                if(stream.codecs)
+                    console.log("    Codecs: " + stream.codecs);
+
+                if(stream["video-range"])
+                    console.log("    Video range: " + stream["video-range"]);
+            }
+
+            if(opts.listStreams)
+                return process.exit(0);
+
+            if(opts.stream !== undefined && opts.stream >= 1 && opts.stream <= streams.length)
+            {
+                console.log("Using Stream " + opts.stream);
+
+                stream = streams[opts.stream - 1];
+            }
+            else
+            {
+                console.log("Defaulting to first stream");
+
+                stream = streams[0];
+            }
+        }
+        else
+        {
+            console.log("No streams found");
+
+            return process.exit(1);
+        }
+
+        let file_name = file_prefix;
+
+        if(typeof(ep) == "object")
+        {
+            file_name += " - " + ep.id.replace(".", "").replace("/", "").replace("\\", "");
+
+            if(ep.title)
+                file_name += " - " + ep.title.replace(".", "").replace("/", "").replace("\\", "");
+        }
+
+        file_name += ".mp4";
+
+        console.log("Downloading to '" + file_name + "'...");
+
+        if(!opts.live)
+        {
+            download_vod(stream.url, file_name)
+                .then(
+                    function ()
+                    {
+                        console.log("Successfully downloaded '" + file_name + "'");
+                    }
+                ).catch(
+                    function (e)
+                    {
+                        console.log("Error downloading '" + file_name + "'");
+                        console.log(e);
+                    }
+                );
+        }
+        else
+        {
+            console.log("Press Ctrl + C to stop downloading");
+
+            await download_live(stream.url, file_name);
+        }
     }
-
-    let parser = m3u8_request(stream_url);
-
-    parser.on(
-        "item",
-        function (data)
-        {
-            console.log(data);
-            console.log(url_rewrite(stream_url, data.url));
-        }
-    );
-    parser.once(
-        "stream",
-        function (data)
-        {
-            console.log(data);
-
-            let full_url = url_rewrite(stream_url, data.url);
-
-            console.log(full_url);
-
-            let parser2 = m3u8_request(full_url);
-
-            parser2.on(
-                "item",
-                function (data)
-                {
-                    //console.log(data);
-                    console.log(url_rewrite(stream_url, data.url));
-                }
-            );
-            parser2.on("end",
-                function ()
-                {
-                    console.log("End item playlist");
-                }
-            );
-        }
-    );
-    parser.on("end",
-        function ()
-        {
-            console.log("End stream playlist");
-        }
-    );
 }
 
 async function main()
 {
     program
         .option("-p, --pid <program-id>", "Program ID from RTP", parseInt)
-        .option("-l, --live", "Toggle live mode, to record live RTP channels")
         .option("-c, --channel <channel-name>", "Specify RTP channel name when using live mode")
         .option("-u, --url <rtp-url>", "Specify an RTP URL, automatically detects live channel name and/or program ID", parseRTPUrl)
+        .option("-s, --stream <stream>", "Use this stream if multiple streams exist", parseInt)
+        .option("-S, --list-streams", "List available streams")
         .option("-d, --debug", "Print debugging information")
         .action(run);
 
