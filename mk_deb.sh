@@ -2,6 +2,8 @@
 
 VERSION="1.0-1"
 
+chmod +x ./assets/bin/ffmpeg/*
+
 pkg .
 
 mkdir -p ./rtp-dl_${VERSION}_amd64/DEBIAN

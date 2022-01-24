@@ -1,3 +1,4 @@
+const OS = require("os");
 const Path = require("path");
 const FileSystem = require("fs");
 const ZLib = require("zlib");
@@ -9,6 +10,10 @@ const HTML = require("node-html-parser");
 const Colors = require("colors");
 const M3U8Parser = require("../lib/m3u8parser.js");
 const Queue = require("../lib/queue.js");
+
+const ffmpeg_bin_name = "ffmpeg-" + process.platform + (process.platform === "win32" ? ".exe" : "");
+const ffmpeg_source_path = Path.join(__dirname, "..", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
+const ffmpeg_install_path = Path.join(OS.tmpdir(), "rtp-dl", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
 
 const program = new Command();
 const package = JSON.parse(FileSystem.readFileSync(Path.join(__dirname, "../package.json")));
@@ -24,6 +29,20 @@ program.configureOutput(
     }
 );
 
+function install_ffmpeg()
+{
+    if(FileSystem.existsSync(ffmpeg_install_path))
+        return;
+
+    console.log("Installing ffmpeg...");
+
+    FileSystem.mkdirSync(Path.dirname(ffmpeg_install_path), { recursive: true });
+
+    if(process.pkg)
+        FileSystem.writeFileSync(ffmpeg_install_path, FileSystem.readFileSync(ffmpeg_source_path));
+    else
+        FileSystem.copyFileSync(ffmpeg_source_path, ffmpeg_install_path);
+}
 function date_str(date)
 {
     return date.getDate() + "-" + (date.getMonth() + 1) + "-" + date.getFullYear();
@@ -299,93 +318,9 @@ async function download_vod(stream_url, file_name)
             if(frags.length === 0)
                 return reject(new Error("No fragments found"));
 
-            let ffmpeg_bin_name = "ffmpeg-" + process.platform + (process.platform === "win32" ? ".exe" : "");
-            let ffmpeg_bin_path = Path.join(__dirname, "..", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
-            let ffmpeg = ChildProcess.spawn(
-                ffmpeg_bin_path,
-                [
-                    "-y",
-                    "-f",
-                    "mpegts",
-                    "-i",
-                    "pipe:0",
-                    "-c:v",
-                    "copy", // TODO: Add transcoding support
-                    "-c:a",
-                    "copy", // TODO: Add transcoding support
-                    file_name
-                ]
-            );
-
-            ffmpeg.once(
-                "close",
-                function (code)
-                {
-                    if(code !== 0)
-                    {
-                        q.kill();
-
-                        return reject(new Error("Transmuxing/transcoding failed"));
-                    }
-
-                    return resolve();
-                }
-            );
-
-            ffmpeg.on(
-                "error",
-                function (e)
-                {
-                    q.kill();
-
-                    return reject(e);
-                }
-            );
-
-            function ts_req_cb(e, data)
-            {
-                if(e)
-                {
-                    q.kill();
-                    ffmpeg.stdin.end();
-
-                    return reject(e);
-                }
-
-                if(ffmpeg.stdin.writable)
-                    ffmpeg.stdin.write(data);
-            }
-
             let q = new Queue(ts_request);
-
-            q.once(
-                "end",
-                function ()
-                {
-                    ffmpeg.stdin.end();
-                }
-            );
-
-            frags.forEach(
-                function (frag)
-                {
-                    q.push(frag.url, ts_req_cb);
-                }
-            );
-        }
-    );
-}
-async function download_live(stream_url, file_name)
-{
-    return new Promise(
-        async function (resolve, reject)
-        {
-            let update = true;
-
-            let ffmpeg_bin_name = "ffmpeg-" + process.platform + (process.platform === "win32" ? ".exe" : "");
-            let ffmpeg_bin_path = Path.join(__dirname, "..", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
             let ffmpeg = ChildProcess.spawn(
-                ffmpeg_bin_path,
+                ffmpeg_install_path,
                 [
                     "-y",
                     "-f",
@@ -397,16 +332,23 @@ async function download_live(stream_url, file_name)
                     "-c:a",
                     "copy", // TODO: Add transcoding support
                     file_name
-                ]
+                ],
+                {
+                    cwd: process.cwd(),
+                    detached: true
+                }
             );
 
             ffmpeg.once(
                 "close",
                 function (code)
                 {
-                    update = false;
+                    q.kill();
 
-                    console.log("Transmuxing/transcoding process finished (" + code + ")");
+                    ffmpeg.removeAllListeners("error");
+
+                    if(code !== 0)
+                        return reject(new Error("Transmuxing/transcoding failed with code " + code));
 
                     return resolve();
                 }
@@ -417,7 +359,8 @@ async function download_live(stream_url, file_name)
                 function (e)
                 {
                     q.kill();
-                    update = false;
+
+                    ffmpeg.removeAllListeners("close");
 
                     return reject(e);
                 }
@@ -431,95 +374,213 @@ async function download_live(stream_url, file_name)
                 }
             );
 
-            function ts_req_cb(e, data)
-            {
-                if(e)
+            ffmpeg.once(
+                "spawn",
+                function ()
+                {
+                    function ts_req_cb(e, data)
+                    {
+                        if(e)
+                        {
+                            q.kill();
+                            ffmpeg.stdin.end();
+
+                            ffmpeg.removeAllListeners("close");
+                            ffmpeg.removeAllListeners("error");
+
+                            return reject(e);
+                        }
+
+                        if(ffmpeg.stdin.writable)
+                            ffmpeg.stdin.write(data);
+                    }
+
+                    q.once(
+                        "end",
+                        function ()
+                        {
+                            ffmpeg.stdin.end();
+                        }
+                    );
+
+                    frags.forEach(
+                        function (frag)
+                        {
+                            q.push(frag.url, ts_req_cb);
+                        }
+                    );
+                }
+            );
+        }
+    );
+}
+async function download_live(stream_url, file_name)
+{
+    return new Promise(
+        function (resolve, reject)
+        {
+            let update = true;
+
+            let q = new Queue(ts_request);
+            let ffmpeg = ChildProcess.spawn(
+                ffmpeg_install_path,
+                [
+                    "-y",
+                    "-f",
+                    "mpegts",
+                    "-i",
+                    "pipe:0",
+                    "-c:v",
+                    "copy", // TODO: Add transcoding support
+                    "-c:a",
+                    "copy", // TODO: Add transcoding support
+                    file_name
+                ],
+                {
+                    cwd: process.cwd(),
+                    detached: true
+                }
+            );
+
+            ffmpeg.once(
+                "close",
+                function (code)
                 {
                     q.kill();
-                    ffmpeg.stdin.end();
                     update = false;
+
+                    process.removeAllListeners("SIGINT");
+                    ffmpeg.removeAllListeners("error");
+
+                    if(code !== 0)
+                        return reject(new Error("Transmuxing/transcoding failed with code " + code));
+
+                    console.log("Transmuxing/transcoding process finished (" + code + ")");
+
+                    return resolve();
+                }
+            );
+
+            ffmpeg.once(
+                "error",
+                function (e)
+                {
+                    q.kill();
+                    update = false;
+
+                    process.removeAllListeners("SIGINT");
+                    ffmpeg.removeAllListeners("close");
 
                     return reject(e);
                 }
+            );
 
-                if(ffmpeg.stdin.writable)
-                    ffmpeg.stdin.write(data);
-            }
-
-            let q = new Queue(ts_request);
-            let last_frag_seq = 0;
-
-            process.once(
-                "SIGINT",
-                function ()
+            ffmpeg.stderr.on(
+                "data",
+                function (data)
                 {
-                    console.log("Got SIGINT, stopping fragment updates");
-                    console.log("Please wait for the list of fragments to drain");
+                    //console.log("ffmpeg stderr: " + data.toString());
+                }
+            );
 
-                    update = false;
-
-                    if(q.tasks.length + q.active > 0)
+            ffmpeg.once(
+                "spawn",
+                async function ()
+                {
+                    function ts_req_cb(e, data)
                     {
-                        q.once(
-                            "end",
-                            function ()
+                        if(e)
+                        {
+                            q.kill();
+                            ffmpeg.stdin.end();
+                            update = false;
+
+                            process.removeAllListeners("SIGINT");
+                            ffmpeg.removeAllListeners("close");
+                            ffmpeg.removeAllListeners("error");
+
+                            return reject(e);
+                        }
+
+                        if(ffmpeg.stdin.writable)
+                            ffmpeg.stdin.write(data);
+                    }
+
+                    let last_frag_seq = 0;
+
+                    process.once(
+                        "SIGINT",
+                        function ()
+                        {
+                            console.log("Got SIGINT, stopping fragment updates");
+                            console.log("Please wait for the list of fragments to drain");
+
+                            update = false;
+
+                            if(q.tasks.length + q.active > 0)
+                            {
+                                q.once(
+                                    "end",
+                                    function ()
+                                    {
+                                        console.log("Fragment queue drained, stopping transcode/transmux");
+
+                                        ffmpeg.stdin.end();
+                                    }
+                                );
+                            }
+                            else
                             {
                                 console.log("Fragment queue drained, stopping transcode/transmux");
 
                                 ffmpeg.stdin.end();
                             }
-                        );
-                    }
-                    else
-                    {
-                        console.log("Fragment queue drained, stopping transcode/transmux");
-
-                        ffmpeg.stdin.end();
-                    }
-                }
-            );
-
-            while(update)
-            {
-                let frags = [];
-                let frag_cnt = 0;
-                let frag_duration = 0;
-
-                try
-                {
-                    frags = await get_ts_fragments(stream_url);
-                }
-                catch(e)
-                {
-                    frags = [];
-                }
-
-                if(frags.length > 0)
-                {
-                    frags.forEach(
-                        function (frag)
-                        {
-                            if(frag.seq > last_frag_seq || (last_frag_seq > 60000 && frag.seq < 1000))
-                            {
-                                let frags_lost = frag.seq - last_frag_seq - 1;
-
-                                if(last_frag_seq > 0 && frags_lost > 0)
-                                    console.log("Lost " + frags_lost + " fragments");
-
-                                q.push(frag.url, ts_req_cb);
-
-                                frag_cnt++;
-                                frag_duration += frag.duration;
-                                last_frag_seq = frag.seq;
-                            }
                         }
                     );
 
-                    console.log("Added " + frag_cnt + " fragments, " + frag_duration + " ms duration, new max " + last_frag_seq);
-                }
+                    while(update)
+                    {
+                        let frags = [];
+                        let frag_cnt = 0;
+                        let frag_duration = 0;
 
-                await sleep(frag_cnt > 0 ? Math.max(5000, Math.round(frag_duration / frag_cnt * 5)) : 2000); // Set timer for approx. 5 fragments
-            }
+                        try
+                        {
+                            frags = await get_ts_fragments(stream_url);
+                        }
+                        catch(e)
+                        {
+                            frags = [];
+                        }
+
+                        if(frags.length > 0)
+                        {
+                            frags.forEach(
+                                function (frag)
+                                {
+                                    if(frag.seq > last_frag_seq || (last_frag_seq > 60000 && frag.seq < 1000))
+                                    {
+                                        let frags_lost = frag.seq - last_frag_seq - 1;
+
+                                        if(last_frag_seq > 0 && frags_lost > 0)
+                                            console.log("Lost " + frags_lost + " fragments");
+
+                                        q.push(frag.url, ts_req_cb);
+
+                                        frag_cnt++;
+                                        frag_duration += frag.duration;
+                                        last_frag_seq = frag.seq;
+                                    }
+                                }
+                            );
+
+                            console.log("Added " + frag_cnt + " fragments, " + frag_duration + " ms duration, new max " + last_frag_seq);
+                        }
+
+                        await sleep(frag_cnt > 0 ? Math.max(5000, Math.round(frag_duration / frag_cnt * 5)) : 2000); // Set timer for approx. 5 fragments
+                    }
+                }
+            );
         }
     );
 }
@@ -1149,6 +1210,8 @@ async function run()
             return process.exit(1);
         }
     }
+
+    install_ffmpeg();
 
     //console.log(opts.url ? opts.url.url : "No URL");
     //console.log(opts.live);
