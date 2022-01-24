@@ -2,7 +2,7 @@
   "name": "rtp-dl",
   "version": "1.0.1",
   "description": "Downloads media from RTP servers",
-  "main": "src/index.js",
+  "main": "src/rtp-dl.js",
   "scripts": {
     "test": "echo \\\"Error: no test specified\\\" && exit 1"
   },
@@ -13,7 +13,7 @@
   "author": "João Silva <jgc3silva@gmail.com>",
   "license": "GPL-3.0-or-later",
   "bin": {
-    "rtp-dl": "./src/index.js"
+    "rtp-dl": "./src/rtp-dl.js"
   },
   "pkg": {
     "scripts": "src/**/*.js",

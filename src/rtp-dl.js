@@ -1375,7 +1375,7 @@ async function main()
 main();
 
 // Commands for testing
-// node src/index.js -u https://www.rtp.pt/play/direto/rtp1
-// node src/index.js -u https://www.rtp.pt/play/p9317/e571868/doce
-// node src/index.js -u https://www.rtp.pt/play/p6755/auga-seca
-// node src/index.js -p 1085
+// node src/rtp-dl.js -u https://www.rtp.pt/play/direto/rtp1
+// node src/rtp-dl.js -u https://www.rtp.pt/play/p9317/e571868/doce
+// node src/rtp-dl.js -u https://www.rtp.pt/play/p6755/auga-seca
+// node src/rtp-dl.js -p 1085
