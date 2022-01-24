@@ -110,4 +110,6 @@ dist
 .tern-port
 
 # Binary packages
+dist/
 *.deb
+!.deb

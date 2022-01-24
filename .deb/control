@@ -1,0 +1,5 @@
+Package: rtp-dl
+Version: 1.0
+Architecture: amd64
+Maintainer: João Silva <jgc3silva@gmail.com>
+Description: Downloads media from RTP servers
