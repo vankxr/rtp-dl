@@ -43,19 +43,37 @@ function install_ffmpeg()
     else
         FileSystem.copyFileSync(ffmpeg_source_path, ffmpeg_install_path);
 }
+function escape_path(str)
+{
+    if(typeof str !== "string")
+        return str;
+
+    return str.replace(/[\\|\/|\"|\'|\.]/g, "");
+}
+function clean_str(input)
+{
+    var output = "";
+
+    for(let i = 0; i < input.length; i++)
+        if(input.charCodeAt(i) <= 127)
+            output += input.charAt(i);
+
+    return output;
+}
 function date_str(date)
 {
     return date.getDate() + "-" + (date.getMonth() + 1) + "-" + date.getFullYear();
 }
 function parseRTPUrl(url)
 {
-    let pid_match = url.match(/play\/p(\d+)(\/e(\d+))?/);
+    let pid_match = url.match(/play(\/([a-z]+))?\/p(\d+)(\/e(\d+))?/);
 
     if(pid_match)
         return {
             url: url,
-            pid: parseInt(pid_match[1]),
-            eid: parseInt(pid_match[3])
+            type: pid_match[2],
+            pid: parseInt(pid_match[3]),
+            eid: parseInt(pid_match[5])
         };
 
     let live_match = url.match(/direto\/([a-zA-Z0-9]+)/);
@@ -102,7 +120,7 @@ async function sleep(ms)
 async function https_request(options, body)
 {
     return new Promise(
-        function (resolve, reject)
+        async function (resolve, reject)
         {
             const req = HTTPS.request(
                 options,
@@ -124,6 +142,15 @@ async function https_request(options, body)
 
                             if(res.headers["content-encoding"] === "gzip")
                                 res.body = ZLib.gunzipSync(res.body);
+                            else if(res.headers["content-encoding"])
+                                throw new Error("Unsupported content encoding: " + res.headers["content-encoding"]);
+
+                            if(res.headers.location && (res.statusCode === 301 || res.statusCode === 302))
+                            {
+                                options.path = res.headers.location;
+
+                                return https_request(options, body).then(resolve, reject);
+                            }
 
                             return resolve(res);
                         }
@@ -173,6 +200,8 @@ function ts_request(frag_url, cb)
 
                     if(res.headers["content-encoding"] === "gzip")
                         res.body = ZLib.gunzipSync(res.body);
+                    else if(res.headers["content-encoding"])
+                        cb(new Error("Unsupported content encoding: " + res.headers["content-encoding"]));
 
                     cb(null, res.body);
                 }
@@ -210,6 +239,10 @@ function m3u8_request(url)
 
                 res.pipe(gunzip);
                 gunzip.pipe(parser);
+            }
+            else if(res.headers["content-encoding"])
+            {
+                parser.end();
             }
             else
             {
@@ -584,6 +617,108 @@ async function download_live(stream_url, file_name)
         }
     );
 }
+async function download_mp3(url, file_name)
+{
+    return new Promise(
+        async function (resolve, reject)
+        {
+            let ffmpeg = ChildProcess.spawn(
+                ffmpeg_install_path,
+                [
+                    "-y",
+                    "-f",
+                    "mp3",
+                    "-i",
+                    "pipe:0",
+                    "-c:v",
+                    "copy", // TODO: Add transcoding support
+                    "-c:a",
+                    "copy", // TODO: Add transcoding support
+                    file_name
+                ],
+                {
+                    cwd: process.cwd(),
+                    detached: true
+                }
+            );
+
+            ffmpeg.once(
+                "close",
+                function (code)
+                {
+                    ffmpeg.removeAllListeners("error");
+
+                    if(code !== 0)
+                        return reject(new Error("Transmuxing/transcoding failed with code " + code));
+
+                    return resolve();
+                }
+            );
+
+            ffmpeg.on(
+                "error",
+                function (e)
+                {
+                    ffmpeg.removeAllListeners("close");
+
+                    return reject(e);
+                }
+            );
+
+            ffmpeg.stderr.on(
+                "data",
+                function (data)
+                {
+                    //console.log("ffmpeg stderr: " + data.toString());
+                }
+            );
+
+            ffmpeg.once(
+                "spawn",
+                function ()
+                {
+                    let url_data = URL.parse(url);
+                    let req_options = {
+                        host: url_data.host,
+                        port: 443,
+                        path: url_data.path,
+                        method: "GET",
+                        headers: {
+                            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36"
+                        }
+                    };
+
+                    const req = HTTPS.request(
+                        req_options,
+                        function (res)
+                        {
+                            if(res.headers["content-encoding"] === "gzip")
+                            {
+                                // Took me a sec to figure out that RTP sometimes responds with gzipped payload
+                                // Even though the request does not claim to accept gzip
+                                // This seems to happen at random times, and is most frequent for secondary channels (i.e. not RTP1)
+                                let gunzip = ZLib.createGunzip();
+
+                                res.pipe(gunzip);
+                                gunzip.pipe(ffmpeg.stdin);
+                            }
+                            else if(res.headers["content-encoding"])
+                            {
+                                return reject(new Error("Unsupported content encoding: " + res.headers["content-encoding"]));
+                            }
+                            else
+                            {
+                                res.pipe(ffmpeg.stdin);
+                            }
+                        }
+                    )
+
+                    req.end();
+                }
+            );
+        }
+    );
+}
 
 async function rtp_get_program_name(pid)
 {
@@ -629,12 +764,10 @@ async function rtp_get_program_name(pid)
 }
 async function rtp_get_program_seasons(pid)
 {
-    let eps = await rtp_get_program_episodes(pid);
+    let url = await rtp_get_program_episodes(pid, true); // Retrieve just one episode URL
 
-    if(eps.length < 1)
-        throw new Error("No episodes found");
-
-    let url = eps[0].url.url;
+    if(typeof url !== "string" && url.url)
+        url = url.url;
 
     if(!url)
         throw new Error("Invalid episode URL");
@@ -701,7 +834,7 @@ async function rtp_get_program_seasons(pid)
 
     return seasons;
 }
-async function rtp_get_program_episodes(pid)
+async function rtp_get_program_episodes(pid, single_url = false, skip_parts = false)
 {
     let page = 1;
     let episodes = [];
@@ -747,6 +880,9 @@ async function rtp_get_program_episodes(pid)
 
             if(!a || a.tagName.toLowerCase() != "a")
                 continue;
+
+            if(single_url)
+                return a.getAttribute("href");
 
             episode.url = parseRTPUrl(a.getAttribute("href"));
             episode.title = a.getAttribute("title");
@@ -826,6 +962,30 @@ async function rtp_get_program_episodes(pid)
                 episode.title = episode.full_title.split(" - ")[1];
             }
 
+            if(skip_parts)
+            {
+                episode.parts = [
+                    {
+                        number: 1
+                    }
+                ];
+            }
+            else
+            {
+                try
+                {
+                    episode.parts = await rtp_get_episode_parts(episode.url.url);
+                }
+                catch(e)
+                {
+                    episode.parts = [
+                        {
+                            number: 1
+                        }
+                    ];
+                }
+            }
+
             episodes.push(episode);
         }
 
@@ -833,6 +993,93 @@ async function rtp_get_program_episodes(pid)
     }
 
     return episodes;
+}
+async function rtp_get_episode_parts(url)
+{
+    let req_options = {
+        host: "www.rtp.pt",
+        port: 443,
+        path: url,
+        method: "GET",
+        headers: {
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": "rtp_cookie_parental=0; rtp_privacy=666; rtp_cookie_privacy=permit 1,2,3,4; googlepersonalization=1; _recid="
+        }
+    };
+
+    let res = await https_request(req_options);
+
+    if(res.statusCode != 200)
+    {
+        let e = new Error("Request unsuccessfull (" + res.statusCode + ")");
+
+        e.details = res.body;
+
+        throw e;
+    }
+
+    if(!res.body)
+        throw new Error("Invalid body");
+
+    let root = HTML.parse(res.body.toString("utf-8"));
+
+    let parts_ul = root.getElementsByTagName("ul").find(
+        function (ul)
+        {
+            if(!ul.getAttribute("class"))
+                return false;
+
+            if(ul.getAttribute("class").indexOf("parts") == -1)
+                return false;
+
+            return true;
+        }
+    );
+
+    if(!parts_ul)
+        throw new Error("Parts ul not found");
+
+    let parts = parts_ul.getElementsByTagName("li");
+
+    if(!parts)
+        throw new Error("No parts found");
+
+    parts = parts.map(
+        function (part)
+        {
+            if(!part.childNodes || !part.childNodes[0])
+                return;
+
+            let child = part.childNodes[0];
+
+            if(!child.getAttribute("title"))
+                return;
+
+            let p_match = child.text.match(/PARTE\s([0-9]+)/);
+
+            if(!p_match)
+                return;
+
+            let number = parseInt(p_match[1]);
+
+            if(isNaN(number) || number < 1)
+                return;
+
+            let p = {};
+
+            p.number = number;
+
+            if(child.getAttribute("title"))
+                p.title = child.getAttribute("title");
+
+            if(child.getAttribute("href"))
+                p.url = parseRTPUrl(child.getAttribute("href"));
+
+            return p;
+        }
+    );
+
+    return parts;
 }
 async function rtp_get_stream_url(url)
 {
@@ -888,7 +1135,7 @@ async function rtp_get_stream_url(url)
         // Handle plain URL video programs
         //// URL regex stolen from https://stackoverflow.com/a/3809435 :)
         //// Editted to include the 'hls: "...",´
-        f_match = script.text.match(/hls:\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\,/);
+        f_match = script.text.match(/hls\s?:\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\,/);
 
         if(f_match)
             return f_match[1];
@@ -1108,7 +1355,7 @@ async function rtp_get_channel_epg(channel, date)
 
     for(const chan of Object.keys(res_json.result))
     {
-        let chan2 = chan.toLowerCase().replace("-", "");
+        let chan2 = chan.toLowerCase().replace(/\-/g, "");
 
         if(chan2.indexOf(channel.toLowerCase()) == -1)
             continue;
@@ -1191,6 +1438,16 @@ async function run()
 
     if(opts.url)
     {
+        const supported_types = [undefined, "palco"];
+
+        if(supported_types.indexOf(opts.url.type) == -1)
+        {
+            console.log("Invalid url");
+            console.log("Unsupported URL type '" + opts.url.type + "'");
+
+            return process.exit(1);
+        }
+
         if(opts.url.channel)
         {
             opts.live = true;
@@ -1220,7 +1477,6 @@ async function run()
 
     let file_path = "";
     let file_prefix = "";
-    let eps;
 
     if(!opts.live)
     {
@@ -1232,20 +1488,32 @@ async function run()
         console.log("Program name: " + program_name);
 
         file_path = "p" + opts.pid;
-        file_prefix += program_name.replace(".", "").replace("/", "").replace("\\", "");
+        file_prefix += escape_path(program_name);
 
         let program_seasons = await rtp_get_program_seasons(opts.pid);
 
-        console.log("Program seasons: " + (program_seasons.length > 0 ? program_seasons.length : 1));
+        console.log("Program seasons: " + (program_seasons.length > 0 ? program_seasons.map(season => season.number) : 1));
 
         if(program_seasons.length > 0)
             console.log("Selected season: " + program_seasons.find(s => s.url.pid == opts.pid).number);
 
-        let program_eps = await rtp_get_program_episodes(opts.pid);
+        let ep_timeout = setTimeout(
+            function ()
+            {
+                console.log("Episode fetching is taking a long time, you should consider using the '--skip-parts' option");
+            },
+            5000
+        );
 
-        //console.log(program_eps);
+        let program_eps = await rtp_get_program_episodes(opts.pid, false, opts.skipParts);
+
+        clearTimeout(ep_timeout);
+
+        //console.log(program_eps[0]);
 
         console.log("Program episodes: " + program_eps.length);
+
+        let eps;
 
         if(opts.eid)
         {
@@ -1268,6 +1536,144 @@ async function run()
 
             eps = program_eps;
         }
+
+        for(let i = 0; i < eps.length; i++)
+        {
+            let ep = eps[i];
+
+            for(let j = 0; j < ep.parts.length; j++)
+            {
+                let part = ep.parts[j];
+
+                if(ep.parts.length > 1)
+                    console.log("Fething data for part " + part.number + " of episode " + (i + 1) + "/" + eps.length + "...");
+                else
+                    console.log("Fething data for episode " + (i + 1) + "/" + eps.length + "...");
+
+                let ep_url = ep.url.url;
+
+                if(part.url)
+                    ep_url = part.url.url;
+
+                console.log("Episode URL: " + ep_url);
+
+                let master_url = await rtp_get_stream_url(ep_url);
+
+                console.log("Master stream URL: " + master_url);
+
+                let file_name = file_prefix;
+
+                file_name += " - " + (ep.id ? escape_path(ep.id) : ("Ep " + (i + 1)));
+
+                if(ep.title)
+                    file_name += " - " + escape_path(ep.title)
+
+                if(ep.parts.length > 1)
+                    file_name += " - Part " + part.number;
+
+                if(!opts.outputDir)
+                    opts.outputDir = ".";
+
+                file_name += "." + opts.outputFormat;
+                file_name = Path.join(process.cwd(), opts.outputDir, file_path, file_name);
+                file_name = clean_str(file_name);
+
+                if(master_url.indexOf(".m3u8") !== -1)
+                {
+                    let streams = await get_streams(master_url);
+                    let stream;
+
+                    if(streams.length > 0)
+                    {
+                        console.log("Found " + streams.length + " streams");
+
+                        for(let i = 0; i < streams.length; i++)
+                        {
+                            console.log("  Stream " + (i + 1) + ":");
+
+                            const stream = streams[i];
+
+                            if(stream.bandwidth)
+                                console.log("    Bandwidth: " + humanize(parseInt(stream.bandwidth), ["bps", "kbps", "Mbps"]));
+
+                            if(stream.resolution)
+                                console.log("    Resolution: " + stream.resolution);
+
+                            if(stream["frame-rate"])
+                                console.log("    Frame rate: " + stream["frame-rate"]);
+
+                            if(stream.codecs)
+                                console.log("    Codecs: " + stream.codecs);
+
+                            if(stream["video-range"])
+                                console.log("    Video range: " + stream["video-range"]);
+                        }
+
+                        if(opts.listStreams)
+                            return process.exit(0);
+
+                        if(opts.stream < 1 || opts.stream > streams.length)
+                            opts.stream = 1;
+
+                        console.log("Using Stream " + opts.stream);
+
+                        stream = streams[opts.stream - 1];
+                    }
+                    else
+                    {
+                        console.log("No streams found");
+
+                        return process.exit(1);
+                    }
+
+                    console.log("Downloading to '" + file_name + "'...");
+
+                    FileSystem.mkdirSync(Path.join(process.cwd(), opts.outputDir, file_path), { recursive: true });
+
+                    download_vod(stream.url, file_name)
+                        .then(
+                            function ()
+                            {
+                                console.log("Successfully downloaded '" + file_name + "'");
+                            }
+                        )
+                        .catch(
+                            function (e)
+                            {
+                                console.log("Error downloading '" + file_name + "'");
+                                console.log(e);
+                            }
+                        );
+                }
+                else if(master_url.indexOf(".mp3") !== -1)
+                {
+                    console.log("Downloading to '" + file_name + "'...");
+
+                    FileSystem.mkdirSync(Path.join(process.cwd(), opts.outputDir, file_path), { recursive: true });
+
+                    download_mp3(master_url, file_name)
+                        .then(
+                            function ()
+                            {
+                                console.log("Successfully downloaded '" + file_name + "'");
+                            }
+                        )
+                        .catch(
+                            function (e)
+                            {
+                                console.log("Error downloading '" + file_name + "'");
+                                console.log(e);
+                            }
+                        );
+                }
+                else
+                {
+                    console.log("Unknown master stream format");
+
+                    continue;
+                }
+            }
+        }
     }
     else
     {
@@ -1280,7 +1686,7 @@ async function run()
         console.log("Channel Name: " + chan_info.name);
 
         file_path = "c" + chan_info.cid;
-        file_prefix += chan_info.name.replace(".", "").replace("/", "").replace("\\", "");
+        file_prefix += escape_path(chan_info.name);
 
         if(opts.listEpg)
         {
@@ -1306,114 +1712,88 @@ async function run()
         console.log("Currently playing: " + chan_metadata.current.name);
         console.log("Next playing: " + chan_metadata.next[0].name);
 
-        eps = [chan_url];
-    }
+        let master_url = await rtp_get_stream_url(chan_url);
 
-    for(let i = 0; i < eps.length; i++)
-    {
-        let ep = eps[i];
-
-        if(eps.length > 1)
-            console.log("Fething data for episode " + (i + 1) + " of " + eps.length + "...");
-
-        //console.log(ep.url.url);
-
-        let master_url = await rtp_get_stream_url(typeof(ep) == "string" ? ep : ep.url.url);
-
-        //console.log(master_url);
-
-        let streams = await get_streams(master_url);
-        let stream;
-
-        if(streams.length > 0)
-        {
-            console.log("Found " + streams.length + " streams");
-
-            for(let i = 0; i < streams.length; i++)
-            {
-                console.log("  Stream " + (i + 1) + ":");
-
-                const stream = streams[i];
-
-                if(stream.bandwidth)
-                    console.log("    Bandwidth: " + humanize(parseInt(stream.bandwidth), ["bps", "kbps", "Mbps"]));
-
-                if(stream.resolution)
-                    console.log("    Resolution: " + stream.resolution);
-
-                if(stream["frame-rate"])
-                    console.log("    Frame rate: " + stream["frame-rate"]);
-
-                if(stream.codecs)
-                    console.log("    Codecs: " + stream.codecs);
-
-                if(stream["video-range"])
-                    console.log("    Video range: " + stream["video-range"]);
-            }
-
-            if(opts.listStreams)
-                return process.exit(0);
-
-            if(opts.stream < 1 || opts.stream > streams.length)
-                opts.stream = 1;
-
-            console.log("Using Stream " + opts.stream);
-
-            stream = streams[opts.stream - 1];
-        }
-        else
-        {
-            console.log("No streams found");
-
-            return process.exit(1);
-        }
+        console.log("Master stream URL: " + master_url);
 
         let file_name = file_prefix;
 
-        if(typeof(ep) == "object")
-        {
-            file_name += " - " + ep.id.replace(".", "").replace("/", "").replace("\\", "");
-
-            if(ep.title)
-                file_name += " - " + ep.title.replace(".", "").replace("/", "").replace("\\", "");
-        }
-        else if(opts.live)
-        {
-            file_name += " - " + Math.round(new Date().getTime() / 1000);
-        }
+        file_name += " - " + Math.round(new Date().getTime() / 1000);
 
         if(!opts.outputDir)
             opts.outputDir = ".";
 
         file_name += "." + opts.outputFormat;
         file_name = Path.join(process.cwd(), opts.outputDir, file_path, file_name);
+        file_name = clean_str(file_name);
 
-        console.log("Downloading to '" + file_name + "'...");
-
-        FileSystem.mkdirSync(Path.join(process.cwd(), opts.outputDir, file_path), { recursive: true });
-
-        if(!opts.live)
+        if(master_url.indexOf(".m3u8") !== -1)
         {
-            download_vod(stream.url, file_name)
-                .then(
-                    function ()
-                    {
-                        console.log("Successfully downloaded '" + file_name + "'");
-                    }
-                )
-                .catch(
-                    function (e)
-                    {
-                        console.log("Error downloading '" + file_name + "'");
-                        console.log(e);
-                    }
-                );
-        }
-        else
-        {
+            let streams = await get_streams(master_url);
+            let stream;
+
+            if(streams.length > 0)
+            {
+                console.log("Found " + streams.length + " streams");
+
+                for(let i = 0; i < streams.length; i++)
+                {
+                    console.log("  Stream " + (i + 1) + ":");
+
+                    const stream = streams[i];
+
+                    if(stream.bandwidth)
+                        console.log("    Bandwidth: " + humanize(parseInt(stream.bandwidth), ["bps", "kbps", "Mbps"]));
+
+                    if(stream.resolution)
+                        console.log("    Resolution: " + stream.resolution);
+
+                    if(stream["frame-rate"])
+                        console.log("    Frame rate: " + stream["frame-rate"]);
+
+                    if(stream.codecs)
+                        console.log("    Codecs: " + stream.codecs);
+
+                    if(stream["video-range"])
+                        console.log("    Video range: " + stream["video-range"]);
+                }
+
+                if(opts.listStreams)
+                    return process.exit(0);
+
+                if(opts.stream < 1 || opts.stream > streams.length)
+                    opts.stream = 1;
+
+                console.log("Using Stream " + opts.stream);
+
+                stream = streams[opts.stream - 1];
+            }
+            else
+            {
+                console.log("No streams found");
+
+                return process.exit(1);
+            }
+
+            console.log("Downloading to '" + file_name + "'...");
+
+            FileSystem.mkdirSync(Path.join(process.cwd(), opts.outputDir, file_path), { recursive: true });
+
             console.log("Press Ctrl + C to stop downloading");
 
             await download_live(stream.url, file_name);
+        }
+        else if(master_url.indexOf(".mp3") !== -1)
+        {
+            console.log("MP3 Live not supported yet!");
+
+            process.exit(1);
+        }
+        else
+        {
+            console.log("Unknown master stream format");
+
+            process.exit(1);
         }
     }
 }
@@ -1427,6 +1807,7 @@ async function main()
         .addOption(new Option("-s, --stream <stream>", "Use this stream if multiple streams exist").argParser(parseInt).default(1))
         .addOption(new Option("-o, --output-dir <path>", "Set the output directory for media files").default(".", "Current working directory"))
         .addOption(new Option("-f, --output-format <format>", "Set the output file format").choices(["ts", "mp4", "mkv"]).default("ts", "ts (MPEG2 Transport Stream)"))
+        .addOption(new Option("--skip-parts", "Skip episode part metadata fetching (for programs with lots of episodes, part metadata fetching can take quite a while)"))
         .addOption(new Option("-S, --list-streams", "List available streams and exit"))
         .addOption(new Option("-E, --list-epg", "Print program guide and exit"))
         .addOption(new Option("-d, --debug", "Print debugging information"))
@@ -1438,7 +1819,13 @@ async function main()
 main();
 
 // Commands for testing
-// node src/rtp-dl.js -u https://www.rtp.pt/play/direto/rtp1
-// node src/rtp-dl.js -u https://www.rtp.pt/play/p9317/e571868/doce
-// node src/rtp-dl.js -u https://www.rtp.pt/play/p6755/auga-seca
-// node src/rtp-dl.js -p 1085
+// Live
+// node src/rtp-dl.js -o out -u https://www.rtp.pt/play/direto/rtp1
+// Specific episode
+// node src/rtp-dl.js -o out -u https://www.rtp.pt/play/p9317/e571868/doce
+// Multi season series
+// node src/rtp-dl.js -o out -u https://www.rtp.pt/play/p6755/auga-seca
+// Multi part, single episode program
+// node src/rtp-dl.js -o out -u https://www.rtp.pt/play/palco/p9817/e592559/bonga-50-anos-de-carreira
+// Program by id
+// node src/rtp-dl.js -o out -p 1085 --skip-parts
