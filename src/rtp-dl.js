@@ -11,6 +11,8 @@ const Colors = require("colors");
 const M3U8Parser = require("../lib/m3u8parser.js");
 const Queue = require("../lib/queue.js");
 
+let M3U8_USE_USER_AGENT = true;
+
 const ffmpeg_bin_name = "ffmpeg-" + process.platform + (process.platform === "win32" ? ".exe" : "");
 const ffmpeg_source_path = Path.join(__dirname, "..", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
 const ffmpeg_install_path = Path.join(OS.tmpdir(), "rtp-dl", "assets", "bin", "ffmpeg", ffmpeg_bin_name);
@@ -42,6 +44,9 @@ function install_ffmpeg()
         FileSystem.writeFileSync(ffmpeg_install_path, FileSystem.readFileSync(ffmpeg_source_path));
     else
         FileSystem.copyFileSync(ffmpeg_source_path, ffmpeg_install_path);
+
+    if(process.platform === "linux")
+        ChildProcess.execSync("chmod +x " + ffmpeg_install_path);
 }
 function escape_path(str)
 {
@@ -180,6 +185,9 @@ function ts_request(frag_url, cb)
         }
     };
 
+    if(!M3U8_USE_USER_AGENT)
+        delete req_options.headers["User-Agent"];
+
     const req = HTTPS.request(
         req_options,
         function (res)
@@ -225,6 +233,9 @@ function m3u8_request(url)
         }
     };
 
+    if(!M3U8_USE_USER_AGENT)
+        delete req_options.headers["User-Agent"];
+
     const parser = new M3U8Parser();
     const req = HTTPS.request(
         req_options,
@@ -268,7 +279,8 @@ async function get_streams(master_url)
                 function (data)
                 {
                     // Bypasses autist "protection" by RTP
-                    data.url = url_rewrite(master_url, data.url);
+                    if(data.url.indexOf("http") === -1)
+                        data.url = url_rewrite(master_url, data.url);
 
                     streams.push(data);
                 }
@@ -311,7 +323,8 @@ async function get_ts_fragments(stream_url)
                 function (data)
                 {
                     // Bypasses autist "protection" by RTP
-                    data.url = url_rewrite(stream_url, data.url);
+                    if(data.url.indexOf("http") === -1)
+                        data.url = url_rewrite(stream_url, data.url);
 
                     frags.push(data);
                 }
@@ -1127,32 +1140,35 @@ async function rtp_get_stream_url(url)
         // For audio only programs
         //// URL regex stolen from https://stackoverflow.com/a/3809435 :)
         //// Editted to include the 'var f = "...";´
-        let f_match = script.text.match(/var\sf\s=\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\;/);
+        let f_match = script.text.match(/var\sf\s=\s\"?(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"?\;/);
 
         if(f_match)
             return f_match[1];
 
         // Handle plain URL video programs
         //// URL regex stolen from https://stackoverflow.com/a/3809435 :)
-        //// Editted to include the 'hls: "...",´
-        f_match = script.text.match(/hls\s?:\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\,/);
+        //// Editted to include the 'fps|hls: "...",´
+        f_match = script.text.match(/(fps|hls)\s?:\s\"?(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"?\,/);
 
         if(f_match)
-            return f_match[1];
+            return f_match[2];
 
         // Now handle encoded video programs
-        f_match = [...script.text.matchAll(/hls\s?:\s(atob\(\s)?decodeURIComponent\(\[(\"([^\"]+)\"(\,)?)+\].join\(\"\"\)\)/g)];
+        f_match = [...script.text.matchAll(/(fps|hls)\s?:\s(atob\(\s)?decodeURIComponent\(\[(\"([^\"]+)\"(\,)?)+\].join\(\"\"\)\)/g)];
 
-        if(!f_match)
+        if(!f_match.length)
             throw new Error("No stream found");
 
         f_match = f_match.map(m => m[0]);
 
         let f_str = f_match[f_match.length - 1];
 
+        if(!f_str)
+            throw new Error("No stream found");
+
         let c_match = [...f_str.matchAll(/\"([^\"]+)\"(\,)?/g)];
 
-        if(!c_match)
+        if(!c_match.length)
             throw new Error("No stream found");
 
         c_match = c_match.map(m => m[1])
@@ -1160,9 +1176,11 @@ async function rtp_get_stream_url(url)
         let url;
 
         if(on_demand)
-            url = decodeURIComponent(atob(c_match.join("")));
+            url = atob(decodeURIComponent(c_match.join("")));
         if(live)
             url = decodeURIComponent(c_match.join(""));
+
+        url = url.replace("drm-fps", "hls");
 
         return url;
     }
@@ -1580,7 +1598,31 @@ async function run()
 
                 if(master_url.indexOf(".m3u8") !== -1)
                 {
-                    let streams = await get_streams(master_url);
+                    let streams;
+
+                    try
+                    {
+                        M3U8_USE_USER_AGENT = true;
+                        streams = await get_streams(master_url);
+                    }
+                    catch(e)
+                    {
+                        console.log("Failed to get streams with user agent, trying without...");
+
+                        try
+                        {
+                            M3U8_USE_USER_AGENT = false;
+                            streams = await get_streams(master_url);
+                        }
+                        catch(e)
+                        {
+                            console.log("Failed to get streams without user agent, aborting...");
+                            console.error(e);
+
+                            return process.exit(1);
+                        }
+                    }
+
                     let stream;
 
                     if(streams.length > 0)
@@ -1630,20 +1672,37 @@ async function run()
 
                     FileSystem.mkdirSync(Path.join(process.cwd(), opts.outputDir, file_path), { recursive: true });
 
-                    download_vod(stream.url, file_name)
-                        .then(
-                            function ()
-                            {
-                                console.log("Successfully downloaded '" + file_name + "'");
-                            }
-                        )
-                        .catch(
-                            function (e)
-                            {
-                                console.log("Error downloading '" + file_name + "'");
-                                console.log(e);
-                            }
-                        );
+                    if(opts.async)
+                    {
+                        download_vod(stream.url, file_name)
+                            .then(
+                                function ()
+                                {
+                                    console.log("Successfully downloaded '" + file_name + "'");
+                                }
+                            )
+                            .catch(
+                                function (e)
+                                {
+                                    console.log("Error downloading '" + file_name + "'");
+                                    console.log(e);
+                                }
+                            );
+                    }
+                    else
+                    {
+                        try
+                        {
+                            await download_vod(stream.url, file_name);
+
+                            console.log("Successfully downloaded '" + file_name + "'");
+                        }
+                        catch(e)
+                        {
+                            console.log("Error downloading '" + file_name + "'");
+                            console.log(e);
+                        }
+                    }
                 }
                 else if(master_url.indexOf(".mp3") !== -1)
                 {
@@ -1651,20 +1710,37 @@ async function run()
 
                     FileSystem.mkdirSync(Path.join(process.cwd(), opts.outputDir, file_path), { recursive: true });
 
-                    download_mp3(master_url, file_name)
-                        .then(
-                            function ()
-                            {
-                                console.log("Successfully downloaded '" + file_name + "'");
-                            }
-                        )
-                        .catch(
-                            function (e)
-                            {
-                                console.log("Error downloading '" + file_name + "'");
-                                console.log(e);
-                            }
-                        );
+                    if(opts.async)
+                    {
+                        download_mp3(master_url, file_name)
+                            .then(
+                                function ()
+                                {
+                                    console.log("Successfully downloaded '" + file_name + "'");
+                                }
+                            )
+                            .catch(
+                                function (e)
+                                {
+                                    console.log("Error downloading '" + file_name + "'");
+                                    console.log(e);
+                                }
+                            );
+                    }
+                    else
+                    {
+                        try
+                        {
+                            await download_mp3(master_url, file_name);
+
+                            console.log("Successfully downloaded '" + file_name + "'");
+                        }
+                        catch(e)
+                        {
+                            console.log("Error downloading '" + file_name + "'");
+                            console.log(e);
+                        }
+                    }
                 }
                 else
                 {
@@ -1729,7 +1805,31 @@ async function run()
 
         if(master_url.indexOf(".m3u8") !== -1)
         {
-            let streams = await get_streams(master_url);
+            let streams;
+
+            try
+            {
+                M3U8_USE_USER_AGENT = true;
+                streams = await get_streams(master_url);
+            }
+            catch(e)
+            {
+                console.log("Failed to get streams with user agent, trying without...");
+
+                try
+                {
+                    M3U8_USE_USER_AGENT = false;
+                    streams = await get_streams(master_url);
+                }
+                catch(e)
+                {
+                    console.log("Failed to get streams without user agent, aborting...");
+                    console.error(e);
+
+                    return process.exit(1);
+                }
+            }
+
             let stream;
 
             if(streams.length > 0)
@@ -1808,6 +1908,7 @@ async function main()
         .addOption(new Option("-o, --output-dir <path>", "Set the output directory for media files").default(".", "Current working directory"))
         .addOption(new Option("-f, --output-format <format>", "Set the output file format").choices(["ts", "mp4", "mkv"]).default("ts", "ts (MPEG2 Transport Stream)"))
         .addOption(new Option("--skip-parts", "Skip episode part metadata fetching (for programs with lots of episodes, part metadata fetching can take quite a while)"))
+        .addOption(new Option("-a, --async", "Download all episodes at the same time when there are multiple episodes"))
         .addOption(new Option("-S, --list-streams", "List available streams and exit"))
         .addOption(new Option("-E, --list-epg", "Print program guide and exit"))
         .addOption(new Option("-d, --debug", "Print debugging information"))
