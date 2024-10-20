@@ -71,23 +71,41 @@ function date_str(date)
 }
 function parseRTPUrl(url)
 {
-    let pid_match = url.match(/play(\/([a-z]+))?\/p(\d+)(\/e(\d+))?/);
+    url = url.toLowerCase();
 
-    if(pid_match)
-        return {
-            url: url,
-            type: pid_match[2],
-            pid: parseInt(pid_match[3]),
-            eid: parseInt(pid_match[5])
-        };
+    let arquivos = url.indexOf("arquivos.rtp.pt") !== -1;
 
-    let live_match = url.match(/direto\/([a-zA-Z0-9]+)/);
+    if(arquivos)
+    {
+        let name_match = url.match(/(conteudos)\/([^\/]*)\/?/);
 
-    if(live_match)
-        return {
-            url: url,
-            channel: live_match[1]
-        };
+        if(name_match)
+            return {
+                url: url,
+                type: "arquivos",
+                name: name_match[2]
+            };
+    }
+    else
+    {
+        let pid_match = url.match(/play(\/([a-z]+))?\/p(\d+)(\/e(\d+))?/);
+
+        if(pid_match)
+            return {
+                url: url,
+                type: pid_match[2],
+                pid: parseInt(pid_match[3]),
+                eid: parseInt(pid_match[5])
+            };
+
+        let live_match = url.match(/direto\/([a-zA-Z0-9]+)/);
+
+        if(live_match)
+            return {
+                url: url,
+                channel: live_match[1]
+            };
+    }
 
     return {
         url: url
@@ -818,7 +836,7 @@ async function rtp_get_program_seasons(pid)
             if(!div.getAttribute("class"))
                 return false;
 
-            if(div.getAttribute("class").indexOf("seasons-container") == -1)
+            if(div.getAttribute("class").indexOf("seasons-container") == -1 && div.getAttribute("class").indexOf("seasons-available") == -1)
                 return false;
 
             return true;
@@ -828,7 +846,13 @@ async function rtp_get_program_seasons(pid)
     if(!season_div)
         throw new Error("Season div not found");
 
-    let seasons = season_div.getElementsByTagName("option");
+
+    let seasons;
+
+    if(season_div.getAttribute("class").indexOf("seasons-container"))
+        seasons = season_div.getElementsByTagName("option");
+    else
+        seasons = season_div.getElementsByTagName("a");
 
     if(!seasons)
         throw new Error("No seasons found");
@@ -836,10 +860,22 @@ async function rtp_get_program_seasons(pid)
     seasons = seasons.map(
         function (season)
         {
-            return {
-                number: parseInt(season.text.trim().split(" ")[1]),
-                url: parseRTPUrl(season.getAttribute("value"))
+            let s = {
+                number: NaN,
+                url: ""
             };
+
+            s.number = parseInt(season.text.trim());
+
+            if(isNaN(s.number))
+            {
+                s_parts = season.text.trim().split(" ");
+
+                if(s_parts.length >= 2)
+                    s.number = parseInt(s_parts[1]);
+            }
+
+            s.url = parseRTPUrl(season.getAttribute("value"));
         }
     );
 
@@ -1137,53 +1173,67 @@ async function rtp_get_stream_url(url)
         if(script.text.indexOf("RTPPlayer") == -1)
             continue;
 
+        let url;
+
         // For audio only programs
         //// URL regex stolen from https://stackoverflow.com/a/3809435 :)
         //// Editted to include the 'var f = "...";´
-        let f_match = script.text.match(/var\sf\s=\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\;/);
+        let f_match = script.text.match(/var\sf\s?=\s?\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\;/);
 
         if(f_match)
-            return f_match[1];
+            url = f_match[1];
 
         // Handle plain URL video programs
         //// URL regex stolen from https://stackoverflow.com/a/3809435 :)
         //// Editted to include the 'fps|hls: "...",´
-        f_match = script.text.match(/(fps|hls)\s?:\s\"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))\"\,/);
+        if(!url)
+        {
+            f_match = script.text.match(/(((\"|\')?fps(\"|\')?)|((\"|\')?hls(\"|\')?))\s*:\s*(\"|\')(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.,~#?&//=]*))(\"|\')\s*\,?/);
 
-        if(f_match)
-            return f_match[1];
+            if(f_match)
+                url = f_match[9];
+        }
 
         // Now handle encoded video programs
-        f_match = [...script.text.matchAll(/(fps|hls)\s?:\s(atob\(\s)?decodeURIComponent\(\[(\"([^\"]+)\"(\,)?)+\].join\(\"\"\)\)/g)];
+        if(!url)
+        {
+            f_match = [...script.text.matchAll(/(fps|hls)\s?:\s?(atob\(\s)?decodeURIComponent\(\[(\"([^\"]+)\"(\,)?)+\].join\(\"\"\)\)/g)];
 
-        if(!f_match.length)
-            throw new Error("No stream found");
+            if(!f_match.length)
+                throw new Error("No stream found");
 
-        f_match = f_match.map(m => m[0]);
+            f_match = f_match.map(m => m[0]);
 
-        let f_str = f_match[f_match.length - 1];
+            let f_str = f_match[f_match.length - 1];
 
-        if(!f_str)
-            throw new Error("No stream found");
+            if(!f_str)
+                throw new Error("No stream found");
 
-        let c_match = [...f_str.matchAll(/\"([^\"]+)\"(\,)?/g)];
+            let c_match = [...f_str.matchAll(/\"([^\"]+)\"(\,)?/g)];
 
-        if(!c_match.length)
-            throw new Error("No stream found");
+            if(!c_match.length)
+                throw new Error("No stream found");
 
-        c_match = c_match.map(m => m[1])
+            c_match = c_match.map(m => m[1])
 
-        let url;
+            if(on_demand)
+                url = atob(decodeURIComponent(c_match.join("")));
+            if(live)
+                url = decodeURIComponent(c_match.join(""));
+        }
 
-        if(on_demand)
-            url = atob(decodeURIComponent(c_match.join("")));
-        if(live)
-            url = decodeURIComponent(c_match.join(""));
+        if(!url)
+            continue;
 
-        url = url.replace("drm-fps", "hls");
+        if(url.indexOf("/arquivo/") !== -1 && url.indexOf("/drm-fps/") !== -1)
+            url.replace("streaming-vod.rtp.pt", "streaming-arquivo-ondemand.rtp.pt");
+
+        url = url.replace("/drm-fps/", "/hls/");
 
         return url;
     }
+
+    throw new Error("No stream found");
 }
 async function rtp_get_channel_info(url)
 {
@@ -1456,7 +1506,7 @@ async function run()
 
     if(opts.url)
     {
-        const supported_types = [undefined, "palco"];
+        const supported_types = [undefined, "palco", "zigzag", "arquivos"];
 
         if(supported_types.indexOf(opts.url.type) == -1)
         {
