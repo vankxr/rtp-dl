@@ -818,7 +818,7 @@ async function rtp_get_program_seasons(pid)
             if(!div.getAttribute("class"))
                 return false;
 
-            if(div.getAttribute("class").indexOf("seasons-available") == -1)
+            if(div.getAttribute("class").indexOf("seasons-container") == -1)
                 return false;
 
             return true;
@@ -828,7 +828,7 @@ async function rtp_get_program_seasons(pid)
     if(!season_div)
         throw new Error("Season div not found");
 
-    let seasons = season_div.getElementsByTagName("a");
+    let seasons = season_div.getElementsByTagName("option");
 
     if(!seasons)
         throw new Error("No seasons found");
@@ -837,8 +837,8 @@ async function rtp_get_program_seasons(pid)
         function (season)
         {
             return {
-                number: parseInt(season.text.trim()),
-                url: parseRTPUrl(season.getAttribute("href"))
+                number: parseInt(season.text.trim().split(" ")[1]),
+                url: parseRTPUrl(season.getAttribute("value"))
             };
         }
     );
