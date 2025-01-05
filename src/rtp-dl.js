@@ -1951,10 +1951,10 @@ async function run()
 async function main()
 {
     program
-        .addOption(new Option("-p, --pid <program-id>", "Program ID from RTP").argParser(parseInt))
+        .addOption(new Option("-p, --pid <program-id>", "Program ID from RTP").argParser(x => parseInt(x)))
         .addOption(new Option("-c, --channel <channel-name>", "Specify RTP channel name when using live mode"))
         .addOption(new Option("-u, --url <rtp-url>", "Specify an RTP URL, automatically detects live channel name and/or program ID").argParser(parseRTPUrl))
-        .addOption(new Option("-s, --stream <stream>", "Use this stream if multiple streams exist").argParser(parseInt).default(1))
+        .addOption(new Option("-s, --stream <stream>", "Use this stream if multiple streams exist").argParser(x => parseInt(x)).default(1))
         .addOption(new Option("-o, --output-dir <path>", "Set the output directory for media files").default(".", "Current working directory"))
         .addOption(new Option("-f, --output-format <format>", "Set the output file format").choices(["ts", "mp4", "mkv"]).default("ts", "ts (MPEG2 Transport Stream)"))
         .addOption(new Option("--skip-parts", "Skip episode part metadata fetching (for programs with lots of episodes, part metadata fetching can take quite a while)"))
