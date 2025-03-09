@@ -1,17 +1,31 @@
 #!/bin/sh
 
-VERSION="1.0-3"
+DEB_PACKAGE_NAME=$(node -e "console.log(require('./package.json').name)")
+DEB_PACKAGE_DESCRIPTION=$(node -e "console.log(require('./package.json').description)")
+DEB_PACKAGE_VERSION=$(node -e "console.log(require('./package.json').version.split('.').join('-').replace('-', '.'))")
+DEB_PACKAGE_ARCHITECTURE="amd64"
+DEB_PACKAGE_MAINTAINER=$(node -e "console.log(require('./package.json').author)")
+
+BIN_NAME=$(node -e "console.log(Object.keys(require('./package.json').bin)[0])")
+BIN_PATH=./$(node -e "console.log(require('./package.json').pkg.outputPath)")/${BIN_NAME}-linux
+
+DEB_NAME=${DEB_PACKAGE_NAME}_${DEB_PACKAGE_VERSION}_${DEB_PACKAGE_ARCHITECTURE}
+DEB_ROOT=./${DEB_NAME}
 
 chmod +x ./assets/bin/ffmpeg/*
 
 pkg .
 
-mkdir -p ./rtp-dl_${VERSION}_amd64/DEBIAN
-cp ./.deb/control ./rtp-dl_${VERSION}_amd64/DEBIAN
+mkdir -p ${DEB_ROOT}/DEBIAN
+echo "Package: $DEB_PACKAGE_NAME" > ${DEB_ROOT}/DEBIAN/control
+echo "Version: $DEB_PACKAGE_VERSION" >> ${DEB_ROOT}/DEBIAN/control
+echo "Architecture: $DEB_PACKAGE_ARCHITECTURE" >> ${DEB_ROOT}/DEBIAN/control
+echo "Maintainer: $DEB_PACKAGE_MAINTAINER" >> ${DEB_ROOT}/DEBIAN/control
+echo "Description: $DEB_PACKAGE_DESCRIPTION" >> ${DEB_ROOT}/DEBIAN/control
 
-mkdir -p ./rtp-dl_${VERSION}_amd64/usr/local/bin
-cp ./dist/rtp-dl-linux ./rtp-dl_${VERSION}_amd64/usr/local/bin/rtp-dl
+mkdir -p ${DEB_ROOT}/usr/local/bin
+cp ${BIN_PATH} ${DEB_ROOT}/usr/local/bin/${BIN_NAME}
 
-dpkg-deb --build --root-owner-group rtp-dl_${VERSION}_amd64
+dpkg-deb --build --root-owner-group ${DEB_NAME}
 
-rm -rf ./rtp-dl_${VERSION}_amd64
+rm -rf ${DEB_ROOT}
