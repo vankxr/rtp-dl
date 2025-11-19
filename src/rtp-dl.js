@@ -1230,6 +1230,39 @@ async function rtp_get_stream_url(url)
 
         url = url.replace("/drm-fps/", "/hls/");
 
+        // Workaround to get all available bitrates
+        let url_parts = url.split(",");
+        let new_url_parts = [];
+
+        for(const part of url_parts)
+        {
+            if(part.endsWith("nas2.share") && new_url_parts.length === 0)
+            {
+                new_url_parts.push(part);
+
+                continue;
+            }
+
+            if(part.startsWith("/") && part.endsWith(".mp4") && !part.endsWith("_lo.mp4") && !part.endsWith("_hi.mp4") && new_url_parts.length === 1)
+            {
+                new_url_parts.push(part.replace(".mp4", "_hi.mp4"));
+                new_url_parts.push(part);
+                new_url_parts.push(part.replace(".mp4", "_lo.mp4"));
+
+                continue;
+            }
+
+            if(part.endsWith(".m3u8") && new_url_parts.length > 1)
+            {
+                new_url_parts.push(part);
+
+                break;
+            }
+        }
+
+        if(false && new_url_parts.length >= 3 && new_url_parts[new_url_parts.length - 1].endsWith(".m3u8"))
+            url = new_url_parts.join(",");
+
         return url;
     }
 
